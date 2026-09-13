@@ -9,7 +9,8 @@ terraform/.terraform/
 terraform/*.tfstate*
 load-tests/results/
 
-# Local-only portfolio, decision evidence, and hardware notes
+# Local-only project documents, portfolio, decision evidence, and hardware notes
+docs/
 docs-private/
 portfolio-private/
 hardware-private/

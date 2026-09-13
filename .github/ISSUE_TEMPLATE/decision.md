@@ -15,6 +15,6 @@ labels: [decision, needs-evidence]
 
 ## Evidence needed
 
-## Proposed ADR
+## 검토 결과
 
-<!-- Link docs/adr/NNNN-name.md when created. -->
+<!-- ADR 원문은 로컬에서 관리하고, 채팅에서 사용자 검토·승인을 받습니다. -->

@@ -98,16 +98,6 @@ Device Adapter 또는 OCPP Gateway
 | Test | JUnit 5, Testcontainers, Toxiproxy | 통합 환경과 장애 조건 재현 |
 | Load test | k6 및 전용 OCPP Simulator | API·WebSocket·충전기 이벤트 부하 분리 |
 
-## ADR 목록
-
-- ADR-0001: Gateway와 Control Plane 분리
-- ADR-0002: Kafka와 RabbitMQ 역할 분리
-- ADR-0003: OCPP 2.0.1 우선 구현
-- ADR-0004: MQTT 기반 물리 연동에서 OCPP로 단계적 전환
-- 추가 ADR 예정: 이벤트 스키마, 멱등성, Outbox, 데이터 보관, AWS 배포, 인증, 확장 정책
-
-ADR은 비용·데이터 정합성·복구·보안·서비스 경계를 바꾸는 결정에만 작성합니다.
-
 ## 개발 단계
 
 1. 도메인 용어와 이벤트 계약 정의
