@@ -1,0 +1,20 @@
+.gradle/
+build/
+out/
+.idea/
+*.iml
+.DS_Store
+.env
+terraform/.terraform/
+terraform/*.tfstate*
+load-tests/results/
+
+# Local-only portfolio, decision evidence, and hardware notes
+docs-private/
+portfolio-private/
+hardware-private/
+
+# Device and broker credentials
+*.pem
+*.key
+secrets/
