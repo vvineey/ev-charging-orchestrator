@@ -1,19 +1,19 @@
 ---
-name: Technical decision
-about: Record a consequential architecture or technology decision
+name: 기술 결정
+about: 아키텍처 또는 기술 선택과 그 근거를 기록합니다
 title: "[Decision] "
 labels: [decision, needs-evidence]
 ---
 
-## Decision question
+## 결정 질문
 
-## Context and constraints
+## 배경과 제약 조건
 
-## Feasible candidates
+## 검토 가능한 후보
 
-## Selection criteria
+## 선택 기준
 
-## Evidence needed
+## 필요한 근거
 
 ## 검토 결과
 

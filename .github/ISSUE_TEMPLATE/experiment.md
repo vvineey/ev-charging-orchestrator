@@ -1,22 +1,22 @@
 ---
-name: Experiment
-about: Define a repeatable performance, reliability, or failure experiment
+name: 실험
+about: 반복 가능한 성능·신뢰성·장애 실험을 정의합니다
 title: "[Experiment] "
 labels: [experiment]
 ---
 
-## Question and hypothesis
+## 질문과 가설
 
-## System boundary
+## 시스템 범위
 
-## Environment and versions
+## 환경과 버전
 
-## Load or failure model
+## 부하 또는 장애 모델
 
-## Metrics
+## 측정 지표
 
-## Integrity checks
+## 정합성 확인
 
-## Result location
+## 결과 위치
 
-## Revisit decision
+## 재검토 조건
