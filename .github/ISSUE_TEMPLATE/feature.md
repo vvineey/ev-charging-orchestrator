@@ -1,18 +1,18 @@
 ---
-name: 기능
-about: 사용자 또는 운영자가 사용하는 기능을 정의합니다
+name: Feature
+about: Define a user-visible or operational feature
 title: "[Feature] "
 labels: [feature]
 ---
 
-## 사용자 또는 운영자 문제
+## User or operator problem
 
-## 범위
+## Scope
 
-## 수용 기준
+## Acceptance criteria
 
-## 도메인 불변식
+## Domain invariants
 
-## 관련 ADR
+## Related ADRs
 
-## 테스트 계획
+## Test plan

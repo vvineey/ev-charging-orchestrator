@@ -1,20 +1,20 @@
 ---
-name: 버그 또는 장애 분석
-about: 재현 근거와 함께 발견된 결함 또는 장애를 기록합니다
+name: Bug or troubleshooting
+about: Record an observed defect or failure with reproduction evidence
 title: "[Bug] "
 labels: [bug]
 ---
 
-## 발견된 증상
+## Observed symptom
 
-## 재현 조건
+## Reproduction condition
 
-## 영향 범위
+## Impact
 
-## 가설과 확인 근거
+## Hypotheses and evidence
 
-## 원인
+## Root cause
 
-## 수정 내용과 회귀 테스트
+## Fix and regression test
 
-## 잔여 위험
+## Remaining risk
