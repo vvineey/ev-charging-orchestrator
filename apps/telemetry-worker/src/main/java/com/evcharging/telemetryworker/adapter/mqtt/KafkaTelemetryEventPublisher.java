@@ -2,11 +2,12 @@ package com.evcharging.telemetryworker.adapter.mqtt;
 
 import com.evcharging.messaging.contract.ChargerTelemetryPayload;
 import com.evcharging.messaging.contract.DomainEventEnvelope;
-import tools.jackson.core.JacksonException;
-import tools.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
 
 @Component
 @ConditionalOnProperty(name = {"telemetry.kafka-topic", "spring.kafka.bootstrap-servers"})
@@ -19,11 +20,11 @@ public class KafkaTelemetryEventPublisher implements TelemetryEventPublisher {
     public KafkaTelemetryEventPublisher(
             KafkaTemplate<String, String> kafkaTemplate,
             ObjectMapper objectMapper,
-            TelemetryWorkerProperties properties
+            @Value("${telemetry.kafka-topic}") String topic
     ) {
         this.kafkaTemplate = kafkaTemplate;
         this.objectMapper = objectMapper;
-        this.topic = properties.kafkaTopic();
+        this.topic = topic;
     }
 
     @Override
