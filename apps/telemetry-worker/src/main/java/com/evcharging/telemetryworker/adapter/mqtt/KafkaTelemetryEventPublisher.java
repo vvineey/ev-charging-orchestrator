@@ -9,7 +9,7 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
 @Component
-@ConditionalOnProperty(prefix = "telemetry", name = "kafka-topic")
+@ConditionalOnProperty(name = {"telemetry.kafka-topic", "spring.kafka.bootstrap-servers"})
 public class KafkaTelemetryEventPublisher implements TelemetryEventPublisher {
 
     private final KafkaTemplate<String, String> kafkaTemplate;
