@@ -26,28 +26,28 @@ class MqttTelemetryMapperTest {
 
     @Test
     void mapsMqttPayloadToTelemetryEvent() {
-        String rawPayload = """
-                {
-                  "stationId": "EV001",
-                  "chargerNo": 3,
-                  "charging": true,
-                  "power": 120.0,
-                  "timestamp": 1704067200000,
-                  "voltage": 24.0,
-                  "current": 5.0
-                }
-                """;
-
-        DomainEventEnvelope<ChargerTelemetryPayload> event = MAPPER.toEvent(rawPayload);
+        DomainEventEnvelope<ChargerTelemetryPayload> event = MAPPER.toEvent(validPayload(3));
 
         assertThat(event.eventId()).isEqualTo(EVENT_ID);
         assertThat(event.eventType()).isEqualTo(ChargerTelemetryReceived.EVENT_TYPE);
+        assertThat(event.schemaVersion()).isEqualTo(ChargerTelemetryReceived.SCHEMA_VERSION);
         assertThat(event.stationId()).isEqualTo("EV001");
         assertThat(event.evseId()).isEqualTo(3);
         assertThat(event.occurredAt()).isEqualTo(Instant.ofEpochMilli(1704067200000L));
         assertThat(event.receivedAt()).isEqualTo(RECEIVED_AT);
+        assertThat(event.requestId()).isNull();
+        assertThat(event.correlationId()).isEqualTo(EVENT_ID);
+        assertThat(event.payload().timestamp()).isEqualTo(1704067200000L);
         assertThat(event.payload().charging()).isTrue();
         assertThat(event.payload().power()).isEqualByComparingTo("120.0");
+        assertThat(event.payload().voltage()).isEqualByComparingTo("24.0");
+        assertThat(event.payload().current()).isEqualByComparingTo("5.0");
+    }
+
+    @Test
+    void mapsBoundaryChargerNumbersToEvseIds() {
+        assertThat(MAPPER.toEvent(validPayload(1)).evseId()).isEqualTo(1);
+        assertThat(MAPPER.toEvent(validPayload(5)).evseId()).isEqualTo(5);
     }
 
     @Test
@@ -58,21 +58,16 @@ class MqttTelemetryMapperTest {
     }
 
     @Test
-    void rejectsChargerNumberOutsideFivePortRange() {
-        String rawPayload = """
-                {
-                  "stationId": "EV001",
-                  "chargerNo": 6,
-                  "charging": false,
-                  "power": 0.0,
-                  "timestamp": 1704067200000,
-                  "voltage": 0.0,
-                  "current": 0.0
-                }
-                """;
-
+    void rejectsNullJsonPayload() {
         assertThatIllegalArgumentException()
-                .isThrownBy(() -> MAPPER.toEvent(rawPayload))
+                .isThrownBy(() -> MAPPER.toEvent("null"))
+                .withMessage("invalid MQTT telemetry payload");
+    }
+
+    @Test
+    void rejectsChargerNumberOutsideFivePortRange() {
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> MAPPER.toEvent(validPayload(6)))
                 .withMessage("chargerNo must be between 1 and 5");
     }
 
@@ -81,5 +76,110 @@ class MqttTelemetryMapperTest {
         assertThatIllegalArgumentException()
                 .isThrownBy(() -> MAPPER.toEvent("  "))
                 .withMessage("rawPayload must not be blank");
+    }
+
+    @Test
+    void rejectsMissingStationId() {
+        String rawPayload = """
+                {
+                  "chargerNo": 3,
+                  "charging": true,
+                  "power": 120.0,
+                  "timestamp": 1704067200000,
+                  "voltage": 24.0,
+                  "current": 5.0
+                }
+                """;
+
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> MAPPER.toEvent(rawPayload))
+                .withMessage("stationId must not be blank");
+    }
+
+    @Test
+    void rejectsMissingChargingState() {
+        String rawPayload = """
+                {
+                  "stationId": "EV001",
+                  "chargerNo": 3,
+                  "power": 120.0,
+                  "timestamp": 1704067200000,
+                  "voltage": 24.0,
+                  "current": 5.0
+                }
+                """;
+
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> MAPPER.toEvent(rawPayload))
+                .withMessage("charging must not be null");
+    }
+
+    @Test
+    void rejectsMissingTimestamp() {
+        String rawPayload = """
+                {
+                  "stationId": "EV001",
+                  "chargerNo": 3,
+                  "charging": true,
+                  "power": 120.0,
+                  "voltage": 24.0,
+                  "current": 5.0
+                }
+                """;
+
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> MAPPER.toEvent(rawPayload))
+                .withMessage("timestamp must not be null");
+    }
+
+    @Test
+    void rejectsNegativeTimestamp() {
+        String rawPayload = """
+                {
+                  "stationId": "EV001",
+                  "chargerNo": 3,
+                  "charging": true,
+                  "power": 120.0,
+                  "timestamp": -1,
+                  "voltage": 24.0,
+                  "current": 5.0
+                }
+                """;
+
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> MAPPER.toEvent(rawPayload))
+                .withMessage("timestamp must not be negative");
+    }
+
+    @Test
+    void rejectsMissingTelemetryMeasurements() {
+        String rawPayload = """
+                {
+                  "stationId": "EV001",
+                  "chargerNo": 3,
+                  "charging": true,
+                  "timestamp": 1704067200000,
+                  "voltage": 24.0,
+                  "current": 5.0
+                }
+                """;
+
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> MAPPER.toEvent(rawPayload))
+                .withMessage("power must not be null");
+    }
+
+    private static String validPayload(int chargerNo) {
+        return """
+                {
+                  "stationId": "EV001",
+                  "chargerNo": %d,
+                  "charging": true,
+                  "power": 120.0,
+                  "timestamp": 1704067200000,
+                  "voltage": 24.0,
+                  "current": 5.0
+                }
+                """.formatted(chargerNo);
     }
 }

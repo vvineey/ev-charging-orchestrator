@@ -42,7 +42,7 @@ public class MqttTelemetryMapper {
         }
 
         MqttTelemetryMessage message = readMessage(rawPayload);
-        validateChargerNo(message.chargerNo());
+        validateMessage(message);
 
         Instant occurredAt = Instant.ofEpochMilli(message.timestamp());
         ChargerTelemetryPayload payload = new ChargerTelemetryPayload(
@@ -70,6 +70,37 @@ public class MqttTelemetryMapper {
         } catch (JacksonException exception) {
             throw new IllegalArgumentException("invalid MQTT telemetry payload", exception);
         }
+    }
+
+    private void validateMessage(MqttTelemetryMessage message) {
+        if (message == null) {
+            throw new IllegalArgumentException("invalid MQTT telemetry payload");
+        }
+        if (message.stationId() == null || message.stationId().isBlank()) {
+            throw new IllegalArgumentException("stationId must not be blank");
+        }
+        if (message.chargerNo() == null) {
+            throw new IllegalArgumentException("chargerNo must not be null");
+        }
+        if (message.charging() == null) {
+            throw new IllegalArgumentException("charging must not be null");
+        }
+        if (message.timestamp() == null) {
+            throw new IllegalArgumentException("timestamp must not be null");
+        }
+        if (message.timestamp() < 0) {
+            throw new IllegalArgumentException("timestamp must not be negative");
+        }
+        if (message.power() == null) {
+            throw new IllegalArgumentException("power must not be null");
+        }
+        if (message.voltage() == null) {
+            throw new IllegalArgumentException("voltage must not be null");
+        }
+        if (message.current() == null) {
+            throw new IllegalArgumentException("current must not be null");
+        }
+        validateChargerNo(message.chargerNo());
     }
 
     private void validateChargerNo(int chargerNo) {

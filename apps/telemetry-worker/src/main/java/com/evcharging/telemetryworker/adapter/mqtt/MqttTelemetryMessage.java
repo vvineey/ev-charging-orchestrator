@@ -4,10 +4,10 @@ import java.math.BigDecimal;
 
 public record MqttTelemetryMessage(
         String stationId,
-        int chargerNo,
-        boolean charging,
+        Integer chargerNo,
+        Boolean charging,
         BigDecimal power,
-        long timestamp,
+        Long timestamp,
         BigDecimal voltage,
         BigDecimal current
 ) {
