@@ -18,6 +18,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import tools.jackson.databind.ObjectMapper;
 
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -25,6 +26,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 
 @SpringBootTest(classes = MqttAdapterApplication.class, properties = {
         "mqtt.url=tcp://localhost:1883",
@@ -61,6 +63,8 @@ class MqttTelemetryFlowTest {
 
     @Test
     void routesInboundPayloadThroughMapperAndKafkaPublisher() throws Exception {
+        when(kafkaTemplate.send(eq("charger.telemetry"), eq("test-station"), org.mockito.ArgumentMatchers.anyString()))
+                .thenReturn(new CompletableFuture<>());
         String payload = """
                 {"stationId":"test-station","chargerNo":5,"charging":true,
                  "power":120.0,"timestamp":1704067200000,"voltage":24.0,"current":5.0}

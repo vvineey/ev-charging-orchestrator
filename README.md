@@ -2,7 +2,7 @@
 
 충전사업자(CPO)를 위한 통합 운영 플랫폼을 설계·구현하는 프로젝트입니다. 충전기 상태 관제부터 거래 세션, 요금 계산, 결제, AI 전력 스케줄과 원격 제어까지 하나의 업무 흐름으로 연결하는 것이 목표입니다. Raspberry Pi는 센서·통신 경로를 검증하는 축소형 장비이며, 상용 충전기 연동은 OCPP 2.0.1 Gateway와 시뮬레이터로 별도 검증합니다.
 
-> **현재 구현 범위:** 공통 telemetry 이벤트 계약과 별도 `apps/mqtt-adapter` 앱의 MQTT payload 검증·변환·Kafka 발행 호출 코드 및 테스트가 있습니다. `telemetry-worker`에는 MQTT 입력 코드가 없으며 실행 앱 골격만 있습니다. Kafka 소비자·조회 모델, 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 아직 구현하거나 통합 검증하지 않았습니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
+> **현재 구현 범위:** 공통 telemetry 이벤트 계약과 별도 `apps/mqtt-adapter` 앱의 MQTT payload 검증·변환·Kafka 발행 및 Future 결과 관찰 코드와 테스트가 있습니다. `telemetry-worker`에는 MQTT 입력 코드가 없으며 실행 앱 골격만 있습니다. Kafka 소비자·조회 모델, 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 아직 구현하거나 통합 검증하지 않았습니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
 
 ## 해결하려는 문제
 
@@ -110,7 +110,7 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 
 | 경로 | 현재 구현과 책임 |
 |---|---|
-| `apps/mqtt-adapter` | MQTT 연결·구독·재연결, 입력 검증·EVSE 매핑, 공통 이벤트 생성·Kafka 발행 호출 |
+| `apps/mqtt-adapter` | MQTT 연결·구독·재연결, 입력 검증·EVSE 매핑, 공통 이벤트 생성·Kafka 발행·Future 결과 관찰 |
 | `apps/telemetry-worker` | 실행 앱 골격. 공통 상태·계측 Kafka 소비와 조회 모델 처리는 후속 구현 |
 | `apps/ocpp-gateway` | 실행 앱 골격. OCPP 2.0.1 연결·정규화·발행·명령 전송은 후속 구현 |
 | `apps/control-plane` | 실행 앱 골격. 사용자·운영자 업무 API는 후속 구현 |
@@ -143,7 +143,13 @@ MQTT 수신을 활성화하려면 MQTT·Kafka 브로커를 준비하고 Adapter�
 .\gradlew.bat test
 ```
 
-테스트는 입력 계약·Kafka 전송 호출·앱 시작을 검증합니다. 실제 MQTT/Kafka 전달, 브로커 ACK, 재연결·장애 복구, DB·장비 연동은 별도 통합 검증 대상입니다. Kafka 발행 Future의 성공·실패 관찰은 [Issue #8](https://github.com/vvineey/ev-charging-orchestrator/issues/8)에서 진행합니다.
+Adapter는 Future 성공 완료 뒤 `eventId`, topic, partition, offset을 기록합니다. 오류는 `json_serialization`, `send`, `async` 단계와 예외·원인 타입으로 기록하고 원본 payload·record key·예외 메시지·stack trace를 발행 결과 로그에 넣지 않습니다. Kafka 또는 Java timeout을 포함한 원인 체인은 `outcome=unknown`으로 표시합니다. JSON 직렬화 예외의 기존 wrapping과 동기 send 예외 전파는 유지합니다.
+
+기본 LoggingProducerListener는 Adapter의 no-op listener로 대체해 중복 오류·내용 출력을 막고 KafkaTemplate 로그 수준은 INFO로 둡니다. 명시적으로 KafkaTemplate DEBUG/TRACE를 켜면 라이브러리가 record 내용을 출력할 수 있습니다. 결과를 기다리는 `get`·`join`·`flush`와 애플리케이션 재발행은 추가하지 않았습니다. Kafka `send()` 자체의 metadata·buffer 대기는 기존 producer 설정에 따릅니다.
+
+`outcome=completed`는 producer의 설정에 따른 Future 완료이며 consumer·DB 반영을 뜻하지 않습니다. 브로커 설정만 준 테스트 컨텍스트에서 Kafka client의 기본 `acks=all`(정규화된 값 `-1`)을 확인했고 설정은 변경하지 않았습니다. 운영 환경의 override·ISR·topic 설정과 실제 전달 확인은 별도 검증 대상입니다. `acks=0`이면 완료해도 offset은 `-1`이고 브로커 수신 확인이 없습니다.
+
+테스트는 입력 계약·Future 완료 전/성공/실패·timeout·예외 전파·안전한 결과 로그·앱 설정을 검증합니다. 실제 KafkaTemplate과 MockProducer의 callback도 확인하며 실제 MQTT/Kafka 전달, 브로커 ACK, 재연결·장애 복구, DB·장비 연동은 별도 통합 검증 대상입니다. 관련 작업은 [Issue #8](https://github.com/vvineey/ev-charging-orchestrator/issues/8)입니다.
 
 ## 개발 단계
 
