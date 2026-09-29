@@ -16,3 +16,7 @@ dependencies {
     testImplementation(project(":modules:test-support"))
     testImplementation("org.springframework.boot:spring-boot-starter-test")
 }
+
+tasks.named<org.springframework.boot.gradle.tasks.run.BootRun>("bootRun") {
+    workingDir(rootProject.projectDir)
+}
