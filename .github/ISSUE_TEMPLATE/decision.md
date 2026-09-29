@@ -5,15 +5,15 @@ title: "[Decision] "
 labels: [decision, needs-evidence]
 ---
 
-## Decision question
+## 결정 질문
 
-## Context and constraints
+## 배경과 제약 조건
 
-## Feasible candidates
+## 검토 가능한 후보
 
-## Selection criteria
+## 선택 기준
 
-## Evidence needed
+## 필요한 근거
 
 ## 검토 결과
 

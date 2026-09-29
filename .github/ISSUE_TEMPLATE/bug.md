@@ -5,16 +5,16 @@ title: "[Bug] "
 labels: [bug]
 ---
 
-## Observed symptom
+## 발견된 증상
 
-## Reproduction condition
+## 재현 조건
 
-## Impact
+## 영향 범위
 
-## Hypotheses and evidence
+## 가설과 확인 근거
 
-## Root cause
+## 원인
 
-## Fix and regression test
+## 수정 내용과 회귀 테스트
 
-## Remaining risk
+## 잔여 위험

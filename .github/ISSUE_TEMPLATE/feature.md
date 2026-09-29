@@ -5,14 +5,14 @@ title: "[Feature] "
 labels: [feature]
 ---
 
-## User or operator problem
+## 사용자 또는 운영자 문제
 
-## Scope
+## 범위
 
-## Acceptance criteria
+## 수용 기준
 
-## Domain invariants
+## 도메인 불변식
 
-## Related ADRs
+## 관련 ADR
 
-## Test plan
+## 테스트 계획

@@ -5,18 +5,18 @@ title: "[Experiment] "
 labels: [experiment]
 ---
 
-## Question and hypothesis
+## 질문과 가설
 
-## System boundary
+## 시스템 범위
 
-## Environment and versions
+## 환경과 버전
 
-## Load or failure model
+## 부하 또는 장애 모델
 
-## Metrics
+## 측정 지표
 
-## Integrity checks
+## 정합성 확인
 
-## Result location
+## 결과 위치
 
-## Revisit decision
+## 재검토 조건
