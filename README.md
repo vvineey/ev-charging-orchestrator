@@ -2,7 +2,7 @@
 
 충전사업자(CPO)를 위한 통합 운영 플랫폼을 설계·구현하는 프로젝트입니다. 충전기 상태 관제부터 거래 세션, 요금 계산, 결제, AI 전력 스케줄과 원격 제어까지 하나의 업무 흐름으로 연결하는 것이 목표입니다. Raspberry Pi는 센서·통신 경로를 검증하는 축소형 장비이며, 상용 충전기 연동은 OCPP 2.0.1 Gateway와 시뮬레이터로 별도 검증합니다.
 
-> **현재 구현 범위:** 공통 telemetry 이벤트 계약과 별도 `apps/mqtt-adapter` 앱의 MQTT payload 검증·변환·Kafka 발행 및 Future 결과 관찰 코드와 테스트가 있습니다. `telemetry-worker`에는 MQTT 입력 코드가 없으며 실행 앱 골격만 있습니다. Kafka 소비자·조회 모델, 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 아직 구현하거나 통합 검증하지 않았습니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
+> **현재 구현 범위:** 공통 telemetry 이벤트 계약과 별도 `apps/mqtt-adapter` 앱의 MQTT payload 검증·변환·Kafka 발행 및 Future 결과 관찰 코드와 테스트가 있습니다. `telemetry-worker`에는 JDBC·Flyway 기반 PostgreSQL 최신 상태 저장소와 실제 DB 테스트가 있으며 MQTT 입력 코드는 없습니다. Kafka 소비자·조회 API, 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 아직 구현하거나 통합 검증하지 않았습니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
 
 ## 해결하려는 문제
 
@@ -111,7 +111,7 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 | 경로 | 현재 구현과 책임 |
 |---|---|
 | `apps/mqtt-adapter` | MQTT 연결·구독·재연결, 입력 검증·EVSE 매핑, 공통 이벤트 생성·Kafka 발행·Future 결과 관찰 |
-| `apps/telemetry-worker` | 실행 앱 골격. 공통 상태·계측 Kafka 소비와 조회 모델 처리는 후속 구현 |
+| `apps/telemetry-worker` | PostgreSQL 최신 telemetry 상태 저장·조건부 갱신과 Flyway migration. Kafka 소비·조회 API는 후속 구현 |
 | `apps/ocpp-gateway` | 실행 앱 골격. OCPP 2.0.1 연결·정규화·발행·명령 전송은 후속 구현 |
 | `apps/control-plane` | 실행 앱 골격. 사용자·운영자 업무 API는 후속 구현 |
 | `apps/ai-worker` | 실행 앱 골격. RabbitMQ 계산 작업 처리는 후속 구현 |
@@ -123,7 +123,7 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 
 ## 로컬 실행과 검증
 
-Java 21 환경에서 프로젝트 루트의 서로 다른 터미널로 실행합니다. 설정이 없으면 Adapter는 브로커에 연결하지 않고 시작합니다. worker에는 MQTT 설정을 전달해도 MQTT 입력이 활성화되지 않습니다.
+Java 21 환경에서 프로젝트 루트에서 실행합니다. 설정이 없으면 Adapter는 브로커에 연결하지 않고 시작합니다. worker는 접근 가능한 PostgreSQL과 `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD` 설정이 필요하며, DB 설정 누락·접속 또는 migration 실패 시 시작하지 않습니다. 연결 정보는 실행 환경에 제공하며 저장소에 기록하지 않습니다. worker에는 MQTT 설정을 전달해도 MQTT 입력이 활성화되지 않습니다.
 
 ```powershell
 .\gradlew.bat :apps:mqtt-adapter:bootRun
@@ -143,22 +143,29 @@ MQTT 수신을 활성화하려면 MQTT·Kafka 브로커를 준비하고 Adapter�
 .\gradlew.bat test
 ```
 
+worker 테스트는 Docker가 실행 중이어야 하며 Testcontainers가 `postgres:18.3-alpine`을 시작·종료합니다. Docker를 사용할 수 없을 때 실제 DB 검증을 자동으로 건너뛰지 않습니다. macOS·Linux에서는 `./gradlew :apps:telemetry-worker:test`로 실행합니다.
+
+최신 상태는 `(station_id, evse_id)`별 한 행입니다. 더 최신인 `occurredAt`, 이어 `receivedAt`만 반영하고 두 시각이 모두 같으면 기존 행을 유지합니다. 저장·비교 시각은 UTC microsecond로 절삭하며 원본 이벤트는 변경하지 않습니다. 중복·과거 입력은 계측값·`last_event_id`·`updated_at`을 바꾸지 않습니다. 계측값은 BigDecimal과 PostgreSQL NUMERIC으로 저장합니다. 같은 이벤트의 재전달 처리와 MQTT 원천 중복 식별은 다르며, 이 저장 방식은 결제·누적 계산의 중복 실행 방지를 제공하지 않습니다.
+
+저장 서비스는 아직 Kafka listener나 HTTP API와 연결되지 않았습니다. 실제 PostgreSQL에서 신규·최신·중복·과거·동률·정밀도 왕복·동시 입력과 저장 직후 SQL 실패 rollback을 검증합니다. 관련 작업은 [Issue #12](https://github.com/vvineey/ev-charging-orchestrator/issues/12)입니다.
+
 Adapter는 Future 성공 완료 뒤 `eventId`, topic, partition, offset을 기록합니다. 오류는 `json_serialization`, `send`, `async` 단계와 예외·원인 타입으로 기록하고 원본 payload·record key·예외 메시지·stack trace를 발행 결과 로그에 넣지 않습니다. Kafka 또는 Java timeout을 포함한 원인 체인은 `outcome=unknown`으로 표시합니다. JSON 직렬화 예외의 기존 wrapping과 동기 send 예외 전파는 유지합니다.
 
 기본 LoggingProducerListener는 Adapter의 no-op listener로 대체해 중복 오류·내용 출력을 막고 KafkaTemplate 로그 수준은 INFO로 둡니다. 명시적으로 KafkaTemplate DEBUG/TRACE를 켜면 라이브러리가 record 내용을 출력할 수 있습니다. 결과를 기다리는 `get`·`join`·`flush`와 애플리케이션 재발행은 추가하지 않았습니다. Kafka `send()` 자체의 metadata·buffer 대기는 기존 producer 설정에 따릅니다.
 
 `outcome=completed`는 producer의 설정에 따른 Future 완료이며 consumer·DB 반영을 뜻하지 않습니다. 브로커 설정만 준 테스트 컨텍스트에서 Kafka client의 기본 `acks=all`(정규화된 값 `-1`)을 확인했고 설정은 변경하지 않았습니다. 운영 환경의 override·ISR·topic 설정과 실제 전달 확인은 별도 검증 대상입니다. `acks=0`이면 완료해도 offset은 `-1`이고 브로커 수신 확인이 없습니다.
 
-테스트는 입력 계약·Future 완료 전/성공/실패·timeout·예외 전파·안전한 결과 로그·앱 설정을 검증합니다. 실제 KafkaTemplate과 MockProducer의 callback도 확인하며 실제 MQTT/Kafka 전달, 브로커 ACK, 재연결·장애 복구, DB·장비 연동은 별도 통합 검증 대상입니다. 관련 작업은 [Issue #8](https://github.com/vvineey/ev-charging-orchestrator/issues/8)입니다.
+Adapter 테스트는 입력 계약·Future 완료 전/성공/실패·timeout·예외 전파·안전한 결과 로그·앱 설정을 검증합니다. 실제 KafkaTemplate과 MockProducer의 callback도 확인하며 실제 MQTT/Kafka 전달, 브로커 ACK, 재연결·장애 복구와 장비부터 DB까지의 연결은 별도 통합 검증 대상입니다. 관련 작업은 [Issue #8](https://github.com/vvineey/ev-charging-orchestrator/issues/8)입니다.
 
 ## 개발 단계
 
-1. **진행 중:** 공통 telemetry 계약과 Raspberry Pi MQTT 입력·Kafka 발행 코드 검증
-2. **다음 설계:** OCPP 거래 계약, 안정적인 원천 식별자, 세션·요금·결제 경계 결정
-3. **핵심 실험:** 통신 단절 뒤 지연·중복·역순 거래 이벤트의 세션 복구와 중복 청구 방지
-4. Kafka 조회 모델·독립 소비자, RabbitMQ AI 작업과 결과 반영 구현
-5. Outbox·멱등 처리·명령 상태 머신, PG 대사와 장애 복구 검증
-6. AWS Staging 부하·복구 측정 후 설계와 목표 재조정
+1. **구현:** 공통 telemetry 계약, 별도 MQTT 입력·Kafka 발행 결과 관찰, PostgreSQL 최신 상태 저장소
+2. **다음 구현:** Kafka 소비·DB 반영·실패 재처리, 내부 HTTPS 조회와 운영자 API 연결
+3. **후속 설계:** OCPP 거래 계약, 안정적인 원천 식별자, 세션·요금·결제 경계 결정
+4. **핵심 실험:** 통신 단절 뒤 지연·중복·역순 거래 이벤트의 세션 복구와 중복 청구 방지
+5. Kafka 독립 소비자, RabbitMQ AI 작업과 결과 반영 구현
+6. Outbox·멱등 처리·명령 상태 머신, PG 대사와 장애 복구 검증
+7. AWS Staging 부하·복구 측정 후 설계와 목표 재조정
 
 ## 하드웨어 테스트베드
 
