@@ -2,7 +2,7 @@
 
 충전사업자(CPO)를 위한 통합 운영 플랫폼을 설계·구현하는 프로젝트입니다. 충전기 상태 관제부터 거래 세션, 요금 계산, 결제, AI 전력 스케줄과 원격 제어까지 하나의 업무 흐름으로 연결하는 것이 목표입니다. Raspberry Pi는 센서·통신 경로를 검증하는 축소형 장비이며, 상용 충전기 연동은 OCPP 2.0.1 Gateway와 시뮬레이터로 별도 검증합니다.
 
-> **현재 구현 범위:** 공통 telemetry 이벤트 계약과 별도 `apps/mqtt-adapter` 앱의 MQTT payload 검증·변환·Kafka 발행 및 Future 결과 관찰 코드와 테스트가 있습니다. `telemetry-worker`에는 JDBC·Flyway 기반 PostgreSQL 최신 상태 저장소와 실제 DB 테스트가 있으며 MQTT 입력 코드는 없습니다. Kafka 소비자·조회 API, 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 아직 구현하거나 통합 검증하지 않았습니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
+> **현재 구현 범위:** 공통 telemetry 이벤트 계약과 별도 `apps/mqtt-adapter`의 MQTT 검증·변환·Kafka 발행 결과 관찰을 구현했습니다. `telemetry-worker`는 Kafka 동기 소비·계약 검증·JDBC/Flyway 최신 상태 저장·실패 정지와 같은 그룹 재시작을 실제 Kafka/PostgreSQL에서 검증합니다. 조회 API, 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 후속입니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
 
 ## 해결하려는 문제
 
@@ -62,7 +62,7 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 
 ### 충전기 이벤트
 
-1. 현재 Raspberry Pi는 전압·전류·순간 전력·충전 여부를 MQTT로 보냅니다. Adapter는 이를 `ChargerTelemetryReceived`로 변환해 `stationId` 키로 Kafka에 발행합니다. 새 로컬 브로커에서 합성 MQTT 입력 한 건의 Kafka 수신·producer 완료를 확인했습니다. 실장비와 DB·API까지의 전달은 아직 검증하지 않았습니다.
+1. 현재 Raspberry Pi는 전압·전류·순간 전력·충전 여부를 MQTT로 보냅니다. Adapter는 이를 `ChargerTelemetryReceived`로 변환해 `stationId` 키로 Kafka에 발행합니다. 로컬 환경에서 합성 MQTT 입력 한 건의 Kafka 발행·소비·DB 고정 값/이벤트 ID 일치와 commit offset 2·lag 0을 확인했습니다. 실장비와 API 전달은 후속 검증입니다.
 2. 목표 설계에서는 OCPP 충전기의 상태·계량·거래 이벤트도 Gateway가 검증하고 프로토콜 중립 이벤트로 발행합니다.
 3. 각 소비자는 필요한 이벤트를 독립 처리합니다. 현재 상태·고장 조회, 거래 세션 복구, AI 입력은 처리 목적과 재처리 기준이 다릅니다.
 4. Kafka의 보존 기간 안에서는 소비자가 offset부터 다시 읽어 조회 모델을 복구할 수 있습니다. Kafka 기록 순서가 장비에서 발생한 거래 순서와 같다는 보장은 없으므로 거래 순번과 누적 계량값을 따로 검증해야 합니다.
@@ -111,7 +111,7 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 | 경로 | 현재 구현과 책임 |
 |---|---|
 | `apps/mqtt-adapter` | MQTT 연결·구독·재연결, 입력 검증·EVSE 매핑, 공통 이벤트 생성·Kafka 발행·Future 결과 관찰 |
-| `apps/telemetry-worker` | PostgreSQL 최신 telemetry 상태 저장·조건부 갱신과 Flyway migration. Kafka 소비·조회 API는 후속 구현 |
+| `apps/telemetry-worker` | Kafka envelope v1 검증·동기 소비·PostgreSQL 최신 상태 저장·조건부 갱신·실패 정지. 조회 API는 후속 |
 | `apps/ocpp-gateway` | 실행 앱 골격. OCPP 2.0.1 연결·정규화·발행·명령 전송은 후속 구현 |
 | `apps/control-plane` | 실행 앱 골격. 사용자·운영자 업무 API는 후속 구현 |
 | `apps/ai-worker` | 실행 앱 골격. RabbitMQ 계산 작업 처리는 후속 구현 |
@@ -132,7 +132,7 @@ docker compose config --quiet
 docker compose up -d --wait postgres kafka mosquitto
 docker compose run --rm kafka-init
 ./gradlew :apps:telemetry-worker:bootRun --args='--spring.profiles.active=local'
-# 별도 터미널: MQTT 입력을 받아 Kafka로 발행
+# worker를 실행한 채 별도 터미널에서 MQTT 입력을 받아 Kafka로 발행
 ./gradlew :apps:mqtt-adapter:bootRun --args='--spring.profiles.active=local'
 ```
 
@@ -150,7 +150,7 @@ PostgreSQL 초기화 스크립트는 빈 volume에서 DB와 앱 계정 `telemetr
 
 `kafka-init`은 `charger.telemetry`를 partition 1·복제 1·최소 ISR 1·delete·7일 보존으로 명시 생성합니다. broker의 자동 토픽 생성은 끕니다. 재실행 시 기존 토픽을 보존하며 설정 변경을 자동 적용하지 않습니다. 앱 producer는 String key/value·`acks=all`·idempotence를 사용합니다. 단일 broker 구성에서 복제 장애 복구나 종단 간 exactly-once를 보장하지 않습니다. Kafka cluster ID는 같은 volume을 재사용하는 동안 유지합니다.
 
-worker는 현재 DB 초기화 후 종료합니다. Kafka listener·HTTP 서버가 아직 없으므로 계속 실행되는 소비자나 조회 서버로 취급하지 않습니다. Adapter의 MQTT→Kafka 발행과 worker의 DB 저장은 아직 소비자로 연결되지 않았습니다. `docker compose stop`은 DB·Kafka 데이터를 보존합니다. volume 삭제는 데이터 삭제이므로 일반 중지 절차에 포함하지 않습니다.
+local profile의 worker는 migration 후 `telemetry-current-state-v1`로 계속 소비합니다. 조회 HTTP 서버는 아직 없습니다. Kafka 주소·topic이 없는 기본 실행은 소비자가 활성화되지 않습니다. `docker compose stop`은 DB·Kafka 데이터를 보존합니다. volume 삭제는 데이터 삭제이므로 일반 중지 절차에 포함하지 않습니다.
 
 local profile을 사용하지 않을 때 Adapter는 브로커 설정 없이 시작할 수 있습니다. worker는 접근 가능한 PostgreSQL과 `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`가 필요하며 설정 누락·접속·migration 실패 시 시작하지 않습니다. `mqtt.url`, `mqtt.topic`, `spring.kafka.bootstrap-servers`, `telemetry.kafka-topic`를 직접 전달하는 실행 방식도 유지합니다. 기본 `mqtt.client-id=telemetry-worker`와 자동 재연결·clean session은 기존대로이며 local profile은 client ID를 `mqtt-adapter-local`로 지정합니다. 이전 worker와 Adapter를 같은 MQTT 구독으로 동시에 실행하지 않습니다.
 
@@ -159,13 +159,19 @@ local profile을 사용하지 않을 때 Adapter는 브로커 설정 없이 시�
 .\gradlew.bat test
 ```
 
-worker 테스트는 Docker가 실행 중이어야 하며 Testcontainers가 `postgres:18.3-alpine`을 시작·종료합니다. Docker를 사용할 수 없을 때 실제 DB 검증을 자동으로 건너뛰지 않습니다. macOS·Linux에서는 `./gradlew :apps:telemetry-worker:test`로 실행합니다.
+worker 테스트는 Docker가 실행 중이어야 하며 Testcontainers가 `postgres:18.3-alpine`·`apache/kafka:4.1.1`을 시작·종료합니다. Docker를 사용할 수 없을 때 실제 DB·broker 검증을 자동으로 건너뛰지 않습니다. macOS·Linux에서는 `./gradlew :apps:telemetry-worker:test`로 실행합니다.
 
 최신 상태는 `(station_id, evse_id)`별 한 행입니다. 더 최신인 `occurredAt`, 이어 `receivedAt`만 반영하고 두 시각이 모두 같으면 기존 행을 유지합니다. 저장·비교 시각은 UTC microsecond로 절삭하며 원본 이벤트는 변경하지 않습니다. 재전달은 eventId·두 시각·payload를 보존한다는 전제이며, 이때 계측값·`last_event_id`·`updated_at`을 바꾸지 않습니다. 과거 입력도 기존 행을 유지합니다. 계측값은 BigDecimal과 PostgreSQL NUMERIC으로 저장합니다. 같은 이벤트의 재전달 처리와 MQTT 원천 중복 식별은 다르며, 이 저장 방식은 결제·누적 계산의 중복 실행 방지를 제공하지 않습니다.
 
 `updated_at`은 반영 시 PostgreSQL의 `clock_timestamp()`로 기록합니다. 같은 트랜잭션의 연속 갱신도 각각의 처리 시각을 기록하며 무시한 입력은 변경하지 않습니다. 같은 eventId에 변경된 시각·내용을 넣은 사건의 거절 정책은 별도 계약 검토 대상으로 남깁니다.
 
-저장 서비스는 아직 Kafka listener나 HTTP API와 연결되지 않았습니다. 실제 PostgreSQL에서 신규·최신·중복·과거·동률·정밀도 왕복·동시 입력과 저장 직후 SQL 실패 rollback을 검증합니다. 관련 작업은 [Issue #12](https://github.com/vvineey/ev-charging-orchestrator/issues/12)입니다.
+저장 서비스는 Kafka listener와 연결됐으며 HTTP API는 후속입니다. 실제 PostgreSQL에서 신규·최신·중복·과거·동률·정밀도 왕복·동시 입력과 저장 직후 SQL 실패 rollback을 검증합니다. 저장소 작업은 [Issue #12](https://github.com/vvineey/ev-charging-orchestrator/issues/12)입니다.
+
+[Issue #17](https://github.com/vvineey/ev-charging-orchestrator/issues/17)의 소비자는 group `telemetry-current-state-v1`, String key/value, auto commit false, earliest, RECORD, concurrency 1을 사용합니다. 신규 그룹·유효 offset이 없는 경우 보존된 처음 기록부터 읽고, 같은 그룹은 commit 위치부터 재시작합니다. 동기 listener가 별도 DB transaction 서비스의 commit 완료 뒤 반환하면 container가 offset을 기록합니다. 두 commit은 원자적이지 않습니다.
+
+실제 Boot JSON mapper로 필수 필드 누락/null·JSON 자료형·타입/버전·key/시각을 검증합니다. 계약·DB 오류는 원본 JSON·key·SQL 예외 메시지를 보존하지 않는 안전한 예외와 위치·가능한 eventId·실패 시각으로 기록하고 `CommonContainerStoppingErrorHandler`가 container를 정지합니다. 실패 record는 skip/DLT 처리하지 않습니다. 잘못된 입력이 계속 남으면 소비도 계속 중단되며 수동 원인 조치가 필요합니다. 앞선 성공 record의 offset 기록은 허용합니다.
+
+실제 Kafka/PostgreSQL 테스트는 실패 offset 유지·뒤 record 미처리·DB rollback·같은 그룹 재시작을 확인합니다. 테스트 전용 별도 JVM은 실제 listener의 DB commit 뒤 `halt(137)`로 종료하고, offset 미기록·재전달 후 값/last_event_id/updated_at 불변을 확인합니다. 이 강제 종료 코드는 테스트에만 있습니다. Kafka retention 밖의 원본 복원·새 조회 모델 재구축·원천 MQTT 중복 식별·이벤트별 처리 이력·결제 멱등성은 제공하지 않습니다.
 
 Adapter는 Future 성공 완료 뒤 `eventId`, topic, partition, offset을 기록합니다. 오류는 `json_serialization`, `send`, `async` 단계와 예외·원인 타입으로 기록하고 원본 payload·record key·예외 메시지·stack trace를 발행 결과 로그에 넣지 않습니다. Kafka 또는 Java timeout을 포함한 원인 체인은 `outcome=unknown`으로 표시합니다. JSON 직렬화 예외의 기존 wrapping과 동기 send 예외 전파는 유지합니다.
 
@@ -173,12 +179,12 @@ Adapter는 Future 성공 완료 뒤 `eventId`, topic, partition, offset을 기�
 
 `outcome=completed`는 producer의 설정에 따른 Future 완료이며 consumer·DB 반영을 뜻하지 않습니다. 브로커 설정만 준 테스트 컨텍스트에서는 Kafka client의 기본 `acks=all`(정규화된 값 `-1`)을 확인했습니다. local profile은 `acks=all`과 idempotence를 명시하며 실제 producer 설정·partition 0/offset 0 완료와 Kafka 수신을 확인했습니다. 운영 환경의 override·ISR·topic 설정은 별도 검증 대상입니다. `acks=0`이면 완료해도 offset은 `-1`이고 브로커 수신 확인이 없습니다.
 
-Adapter 테스트는 입력 계약·Future 완료 전/성공/실패·timeout·예외 전파·안전한 결과 로그·앱 설정을 검증합니다. 실제 KafkaTemplate과 MockProducer의 callback도 확인합니다. [Issue #14](https://github.com/vvineey/ev-charging-orchestrator/issues/14)의 로컬 환경에서는 실제 MQTT→Kafka 한 건 전달, 앱 계정의 Flyway 시작, DB·Kafka 재시작 후 스키마·토픽·입력 기록 유지까지 확인했습니다. 앱을 실행한 채 브로커가 끊겼을 때의 재연결·consumer 장애 복구·장비부터 DB까지의 연결은 후속 검증입니다. 발행 관찰 구현은 [Issue #8](https://github.com/vvineey/ev-charging-orchestrator/issues/8)입니다.
+Adapter 테스트는 입력 계약·Future 완료 전/성공/실패·timeout·예외 전파·안전한 결과 로그·앱 설정을 검증합니다. 실제 KafkaTemplate과 MockProducer의 callback도 확인합니다. [Issue #14](https://github.com/vvineey/ev-charging-orchestrator/issues/14)의 로컬 환경에서는 MQTT→Kafka 한 건·앱 계정 Flyway·정상 재시작 후 스키마/기록 유지를 확인했습니다. #17에서는 두 앱의 local profile로 실제 MQTT→Kafka→DB 연결을 확인했습니다. broker 단절·MQTT 재연결·실장비·API·장시간 부하는 후속입니다. 발행 관찰 구현은 [Issue #8](https://github.com/vvineey/ev-charging-orchestrator/issues/8)입니다.
 
 ## 개발 단계
 
 1. **구현:** 공통 telemetry 계약, 별도 MQTT 입력·Kafka 발행 결과 관찰, PostgreSQL 최신 상태 저장소
-2. **다음 구현:** Kafka 소비·DB 반영·실패 재처리, 내부 HTTPS 조회와 운영자 API 연결
+2. **다음 구현:** 내부 HTTPS 조회와 운영자 API 연결
 3. **후속 설계:** OCPP 거래 계약, 안정적인 원천 식별자, 세션·요금·결제 경계 결정
 4. **핵심 실험:** 통신 단절 뒤 지연·중복·역순 거래 이벤트의 세션 복구와 중복 청구 방지
 5. Kafka 독립 소비자, RabbitMQ AI 작업과 결과 반영 구현

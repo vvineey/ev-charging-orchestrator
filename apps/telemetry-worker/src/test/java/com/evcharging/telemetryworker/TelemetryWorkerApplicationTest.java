@@ -13,6 +13,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         "mqtt.topic=charger/telemetry",
         "mqtt.client-id=worker-must-not-connect",
         "spring.kafka.bootstrap-servers=localhost:9092",
+        "spring.kafka.listener.auto-startup=false",
         "telemetry.kafka-topic=charger.telemetry"
 })
 @Import(PostgreSqlTestConfiguration.class)
