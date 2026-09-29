@@ -1,4 +1,4 @@
-package com.evcharging.telemetryworker.adapter.mqtt;
+package com.evcharging.mqttadapter.adapter.mqtt;
 
 import java.math.BigDecimal;
 

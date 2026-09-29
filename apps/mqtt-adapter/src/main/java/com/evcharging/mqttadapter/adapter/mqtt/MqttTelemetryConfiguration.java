@@ -1,4 +1,4 @@
-package com.evcharging.telemetryworker.adapter.mqtt;
+package com.evcharging.mqttadapter.adapter.mqtt;
 
 import com.evcharging.messaging.contract.ChargerTelemetryPayload;
 import com.evcharging.messaging.contract.DomainEventEnvelope;

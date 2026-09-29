@@ -1,29 +1,27 @@
-package com.evcharging.telemetryworker;
+package com.evcharging.mqttadapter;
 
+import com.evcharging.mqttadapter.adapter.mqtt.KafkaTelemetryEventPublisher;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.ApplicationContext;
+import org.springframework.kafka.core.KafkaTemplate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 @SpringBootTest(properties = {
-        "mqtt.url=tcp://localhost:1883",
-        "mqtt.topic=charger/telemetry",
-        "mqtt.client-id=worker-must-not-connect",
         "spring.kafka.bootstrap-servers=localhost:9092",
         "telemetry.kafka-topic=charger.telemetry"
 })
-class TelemetryWorkerApplicationTest {
+class KafkaPublisherConfigurationTest {
 
     @Autowired
     private ApplicationContext context;
 
     @Test
-    void startsWithoutMqttIngressEvenWhenLegacySettingsArePresent() {
+    void configuresRealKafkaTemplateAndPublisherWithoutMqttConnection() {
+        assertThat(context.getBeansOfType(KafkaTemplate.class)).hasSize(1);
+        assertThat(context.getBeansOfType(KafkaTelemetryEventPublisher.class)).hasSize(1);
         assertThat(context.containsBean("mqttTelemetryFlow")).isFalse();
-        assertThat(context.containsBean("mqttClientFactory")).isFalse();
-        assertThat(context.containsBean("mqttTelemetryMapper")).isFalse();
-        assertThat(context.containsBean("kafkaTelemetryEventPublisher")).isFalse();
     }
 }
