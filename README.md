@@ -113,7 +113,7 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 | `apps/mqtt-adapter` | MQTT 연결·구독·재연결, 입력 검증·EVSE 매핑, 공통 이벤트 생성·Kafka 발행·Future 결과 관찰 |
 | `apps/telemetry-worker` | Kafka envelope v1 검증·동기 소비·PostgreSQL 최신 상태 저장·조건부 갱신·실패 정지·내부 HTTPS 조회 |
 | `apps/ocpp-gateway` | 실행 앱 골격. OCPP 2.0.1 연결·정규화·발행·명령 전송은 후속 구현 |
-| `apps/control-plane` | 실행 앱 골격. 사용자·운영자 업무 API는 후속 구현 |
+| `apps/control-plane` | 운영자 최신 telemetry 목록·단건 API와 worker 내부 HTTPS 조회 연결 구현. 그 밖의 업무 API는 후속 구현 |
 | `apps/ai-worker` | 실행 앱 골격. RabbitMQ 계산 작업 처리는 후속 구현 |
 | `apps/charger-simulator` | 실행 앱 골격. 장비 입력·장애 시나리오 재현은 후속 구현 |
 | `modules/messaging-contract` | envelope v1, telemetry payload, EVSE 식별자와 계약 검증. MQTT·Kafka 구현에 의존하지 않음 |
@@ -165,7 +165,7 @@ local profile을 사용하지 않을 때 Adapter는 브로커 설정 없이 시�
 - 단건: `GET /internal/v1/stations/{stationId}/evses/{evseId}/telemetry/latest`. `stationId`, `evseId`, `charging`, `power`(W), `voltage`(V), `current`(A), `occurredAt`, `receivedAt`, `updatedAt`, `lastEventId`를 반환합니다. 시각은 UTC ISO-8601과 DB microsecond 정밀도입니다.
 - 오류: 잘못된 입력은 400/`INVALID_TELEMETRY_QUERY`, 단건 없음은 404/`TELEMETRY_NOT_FOUND`, DB 조회 불가는 503/`TELEMETRY_QUERY_UNAVAILABLE`. 오류 JSON은 `code`, `message`만 포함합니다.
 
-조회는 commit된 마지막 관측을 읽습니다. Kafka 발행 직후 반영이나 장비 연결 상태를 보장하지 않고, 보고 중단을 충전 종료로 해석하지 않습니다. 데이터 갱신·발행·캐시·재시도를 추가하지 않습니다. control-plane의 운영자 API 중계는 다음 Feature입니다.
+조회는 commit된 마지막 관측을 읽습니다. Kafka 발행 직후 반영이나 장비 연결 상태를 보장하지 않고, 보고 중단을 충전 종료로 해석하지 않습니다. 데이터 갱신·발행·캐시·재시도를 추가하지 않습니다. control-plane의 운영자 API 연결은 아래에서 설명합니다.
 
 TLS 생성 스크립트는 기존 DB·Kafka 설정을 보존하면서 `.env`의 TLS 항목을 채우고, `secrets/`에 30일 유효한 localhost/127.0.0.1 개발용 인증서·PKCS12 키/신뢰 저장소를 만듭니다. 기존 TLS 자료가 있으면 덮어쓰지 않습니다. `.env`는 0600이며 인증 자료는 Git에서 제외합니다. 루트에서 JAR를 실행하면 상대 키 저장소 경로도 같은 루트를 기준으로 합니다. 다른 디렉터리에서는 `TELEMETRY_TLS_KEY_STORE`도 절대 file 경로로 지정합니다.
 
@@ -195,7 +195,7 @@ worker 테스트는 Docker가 실행 중이어야 하며 Testcontainers가 `post
 
 `updated_at`은 반영 시 PostgreSQL의 `clock_timestamp()`로 기록합니다. 같은 트랜잭션의 연속 갱신도 각각의 처리 시각을 기록하며 무시한 입력은 변경하지 않습니다. 같은 eventId에 변경된 시각·내용을 넣은 사건의 거절 정책은 별도 계약 검토 대상으로 남깁니다.
 
-저장 서비스는 Kafka listener와 연결됐으며 HTTP API는 후속입니다. 실제 PostgreSQL에서 신규·최신·중복·과거·동률·정밀도 왕복·동시 입력과 저장 직후 SQL 실패 rollback을 검증합니다. 저장소 작업은 [Issue #12](https://github.com/vvineey/ev-charging-orchestrator/issues/12)입니다.
+저장 서비스는 Kafka listener와 연결됐고 worker 내부 HTTPS·control-plane 운영자 조회도 구현했습니다. 실제 PostgreSQL에서 신규·최신·중복·과거·동률·정밀도 왕복·동시 입력과 저장 직후 SQL 실패 rollback을 검증했습니다. 저장소 작업은 [Issue #12](https://github.com/vvineey/ev-charging-orchestrator/issues/12)입니다.
 
 [Issue #17](https://github.com/vvineey/ev-charging-orchestrator/issues/17)의 소비자는 group `telemetry-current-state-v1`, String key/value, auto commit false, earliest, RECORD, concurrency 1을 사용합니다. 신규 그룹·유효 offset이 없는 경우 보존된 처음 기록부터 읽고, 같은 그룹은 commit 위치부터 재시작합니다. 동기 listener가 별도 DB transaction 서비스의 commit 완료 뒤 반환하면 container가 offset을 기록합니다. 두 commit은 원자적이지 않습니다.
 

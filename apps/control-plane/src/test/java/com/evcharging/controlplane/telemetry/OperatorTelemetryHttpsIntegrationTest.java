@@ -160,6 +160,18 @@ class OperatorTelemetryHttpsIntegrationTest {
     }
 
     @Test
+    void rejectsMalformedWorkerTimestampWithSafe503() throws Exception {
+        for (String timestamp : new String[]{
+                "2025-01-01T00:00:00.123456Z", "2025-01-01T00:00:01.654321Z",
+                "2025-01-01T00:00:02.111222Z"
+        }) {
+            stub.respond.set(path -> LocalHttpsWorkerStub.Reply.json(200,
+                    OBSERVATION.replace(timestamp, "not-an-instantZ")));
+            assertError(get(appPort, DETAIL), 503, "TELEMETRY_QUERY_UNAVAILABLE");
+        }
+    }
+
+    @Test
     void rejectsWrongErrorCodeAndUnexpectedList404() throws Exception {
         stub.respond.set(path -> LocalHttpsWorkerStub.Reply.json(400, NOT_FOUND_BODY));
         assertError(get(appPort, LIST), 503, "TELEMETRY_QUERY_UNAVAILABLE");

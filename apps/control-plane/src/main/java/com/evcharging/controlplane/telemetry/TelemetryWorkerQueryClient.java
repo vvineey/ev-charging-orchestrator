@@ -26,6 +26,7 @@ import java.nio.file.Path;
 import java.security.KeyStore;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
@@ -199,7 +200,11 @@ public class TelemetryWorkerQueryClient implements AutoCloseable {
         if (value == null || !value.asString().endsWith("Z")) {
             return false;
         }
-        return Instant.parse(value.asString()).getNano() % 1_000 == 0;
+        try {
+            return Instant.parse(value.asString()).getNano() % 1_000 == 0;
+        } catch (DateTimeParseException exception) {
+            return false;
+        }
     }
 
     private boolean equalsString(JsonNode object, String field, String expected) {
