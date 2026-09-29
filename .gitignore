@@ -5,6 +5,8 @@ out/
 *.iml
 .DS_Store
 .env
+.env.*
+!.env.example
 terraform/.terraform/
 terraform/*.tfstate*
 load-tests/results/

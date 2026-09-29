@@ -62,7 +62,7 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 
 ### 충전기 이벤트
 
-1. 현재 Raspberry Pi는 전압·전류·순간 전력·충전 여부를 MQTT로 보냅니다. Adapter는 이를 `ChargerTelemetryReceived`로 변환해 `stationId` 키로 Kafka에 발행하도록 구현되어 있습니다. 브로커 수신 확인과 종단 간 전달은 아직 검증하지 않았습니다.
+1. 현재 Raspberry Pi는 전압·전류·순간 전력·충전 여부를 MQTT로 보냅니다. Adapter는 이를 `ChargerTelemetryReceived`로 변환해 `stationId` 키로 Kafka에 발행합니다. 새 로컬 브로커에서 합성 MQTT 입력 한 건의 Kafka 수신·producer 완료를 확인했습니다. 실장비와 DB·API까지의 전달은 아직 검증하지 않았습니다.
 2. 목표 설계에서는 OCPP 충전기의 상태·계량·거래 이벤트도 Gateway가 검증하고 프로토콜 중립 이벤트로 발행합니다.
 3. 각 소비자는 필요한 이벤트를 독립 처리합니다. 현재 상태·고장 조회, 거래 세션 복구, AI 입력은 처리 목적과 재처리 기준이 다릅니다.
 4. Kafka의 보존 기간 안에서는 소비자가 offset부터 다시 읽어 조회 모델을 복구할 수 있습니다. Kafka 기록 순서가 장비에서 발생한 거래 순서와 같다는 보장은 없으므로 거래 순번과 누적 계량값을 따로 검증해야 합니다.
@@ -123,20 +123,36 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 
 ## 로컬 실행과 검증
 
-Java 21 환경에서 프로젝트 루트에서 실행합니다. 설정이 없으면 Adapter는 브로커에 연결하지 않고 시작합니다. worker는 접근 가능한 PostgreSQL과 `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD` 설정이 필요하며, DB 설정 누락·접속 또는 migration 실패 시 시작하지 않습니다. 연결 정보는 실행 환경에 제공하며 저장소에 기록하지 않습니다. worker에는 MQTT 설정을 전달해도 MQTT 입력이 활성화되지 않습니다.
+Java 21과 실행 중인 Docker가 필요합니다. 프로젝트 루트에서 `.env.example`을 `.env`로 복사한 뒤 관리자·앱 비밀번호 두 개를 서로 다른 임의 값으로 바꿉니다. `.env`는 Git에서 제외합니다. Compose는 루트의 `.env`를 읽고, 두 앱은 `local` profile에서만 같은 파일을 properties 형식으로 읽습니다. 비밀번호는 따옴표·`#`·`$`가 없는 임의의 hex 문자열을 권장합니다.
 
-```powershell
-.\gradlew.bat :apps:mqtt-adapter:bootRun
-.\gradlew.bat :apps:telemetry-worker:bootRun
+```sh
+cp .env.example .env
+# .env의 두 비밀번호를 바꾼 후 실행
+docker compose config --quiet
+docker compose up -d --wait postgres kafka mosquitto
+docker compose run --rm kafka-init
+./gradlew :apps:telemetry-worker:bootRun --args='--spring.profiles.active=local'
+# 별도 터미널: MQTT 입력을 받아 Kafka로 발행
+./gradlew :apps:mqtt-adapter:bootRun --args='--spring.profiles.active=local'
 ```
 
-MQTT 수신을 활성화하려면 MQTT·Kafka 브로커를 준비하고 Adapter에 다음 설정을 전달합니다. 예시 주소와 clientId는 로컬 검증용입니다.
+Windows에서는 파일 복사에 `Copy-Item .env.example .env`, 앱 실행에 `.\gradlew.bat`을 사용합니다. `bootRun`의 작업 디렉터리는 루트로 고정되어 있습니다. JAR도 루트에서 실행하거나 `LOCAL_ENV_FILE`을 `.env`의 절대 경로로 지정합니다. local profile에서 파일이 없으면 시작하지 않습니다.
 
-```powershell
-.\gradlew.bat :apps:mqtt-adapter:bootRun --args="--mqtt.url=tcp://localhost:1883 --mqtt.topic=charger/telemetry --mqtt.client-id=mqtt-adapter-local --spring.kafka.bootstrap-servers=localhost:9092 --telemetry.kafka-topic=charger.telemetry --spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer --spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer"
-```
+| 구성 | 호스트 앱의 접속 주소 | Compose 내부 접속 주소 |
+|---|---|---|
+| PostgreSQL 18.3 | `127.0.0.1:15432/telemetry_current` | `postgres:5432/telemetry_current` |
+| Kafka 4.1.1 | `127.0.0.1:19092` | `kafka:29092` |
+| MQTT Mosquitto 2.0 | `tcp://127.0.0.1:11883` | `tcp://mosquitto:1883` |
 
-`mqtt.url`, `mqtt.topic`, `spring.kafka.bootstrap-servers`, `telemetry.kafka-topic`가 모두 설정되어야 MQTT 입력 흐름이 생성됩니다. 기존 `mqtt.client-id` 설정 키와 명시한 값은 그대로 적용되며, 생략 시 기본값 `telemetry-worker`도 호환성을 위해 유지합니다. 기존 자동 재연결·clean session 설정도 유지합니다. 이전 worker의 MQTT 설정을 새 Adapter에 옮기고, 이동 전 worker와 Adapter를 같은 MQTT 구독으로 동시에 실행하지 않습니다.
+기본 Compose 프로젝트는 `evc-current-local`이며 DB·Kafka는 별도 named volume을 사용합니다. 다른 폴더의 기존 테스트 DB·Kafka와 공유하지 않습니다. 모든 공개 포트는 호스트 loopback에만 바인딩합니다. Kafka는 PLAINTEXT·단일 broker·복제/최소 ISR 1, MQTT는 익명 접속의 합성 데이터용 로컬 구성입니다. 원격 장비·운영 배포에는 별도 인증·암호화 설정이 필요합니다.
+
+PostgreSQL 초기화 스크립트는 빈 volume에서 DB와 앱 계정 `telemetry_app`의 소유권을 준비합니다. 앱 계정은 superuser·DB 생성·역할 생성 권한이 없으며, 이 계정으로 Flyway가 업무 테이블을 생성합니다. DB 설정은 `SPRING_DATASOURCE_*`를 사용합니다. 과거 `DB_URL` 등의 별칭은 지원하지 않습니다. 초기화 스크립트는 데이터가 있는 volume에 재실행되지 않으므로 `.env`의 초기 계정·비밀번호 변경만으로 기존 DB 비밀번호가 바뀌지 않습니다. 기존 Flyway V1을 가진 다른 DB를 재사용하거나 자동 repair하지 않습니다.
+
+`kafka-init`은 `charger.telemetry`를 partition 1·복제 1·최소 ISR 1·delete·7일 보존으로 명시 생성합니다. broker의 자동 토픽 생성은 끕니다. 재실행 시 기존 토픽을 보존하며 설정 변경을 자동 적용하지 않습니다. 앱 producer는 String key/value·`acks=all`·idempotence를 사용합니다. 단일 broker 구성에서 복제 장애 복구나 종단 간 exactly-once를 보장하지 않습니다. Kafka cluster ID는 같은 volume을 재사용하는 동안 유지합니다.
+
+worker는 현재 DB 초기화 후 종료합니다. Kafka listener·HTTP 서버가 아직 없으므로 계속 실행되는 소비자나 조회 서버로 취급하지 않습니다. Adapter의 MQTT→Kafka 발행과 worker의 DB 저장은 아직 소비자로 연결되지 않았습니다. `docker compose stop`은 DB·Kafka 데이터를 보존합니다. volume 삭제는 데이터 삭제이므로 일반 중지 절차에 포함하지 않습니다.
+
+local profile을 사용하지 않을 때 Adapter는 브로커 설정 없이 시작할 수 있습니다. worker는 접근 가능한 PostgreSQL과 `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`가 필요하며 설정 누락·접속·migration 실패 시 시작하지 않습니다. `mqtt.url`, `mqtt.topic`, `spring.kafka.bootstrap-servers`, `telemetry.kafka-topic`를 직접 전달하는 실행 방식도 유지합니다. 기본 `mqtt.client-id=telemetry-worker`와 자동 재연결·clean session은 기존대로이며 local profile은 client ID를 `mqtt-adapter-local`로 지정합니다. 이전 worker와 Adapter를 같은 MQTT 구독으로 동시에 실행하지 않습니다.
 
 ```powershell
 .\gradlew.bat :apps:mqtt-adapter:test :apps:telemetry-worker:test
@@ -155,9 +171,9 @@ Adapter는 Future 성공 완료 뒤 `eventId`, topic, partition, offset을 기�
 
 기본 LoggingProducerListener는 Adapter의 no-op listener로 대체해 중복 오류·내용 출력을 막고 KafkaTemplate 로그 수준은 INFO로 둡니다. 명시적으로 KafkaTemplate DEBUG/TRACE를 켜면 라이브러리가 record 내용을 출력할 수 있습니다. 결과를 기다리는 `get`·`join`·`flush`와 애플리케이션 재발행은 추가하지 않았습니다. Kafka `send()` 자체의 metadata·buffer 대기는 기존 producer 설정에 따릅니다.
 
-`outcome=completed`는 producer의 설정에 따른 Future 완료이며 consumer·DB 반영을 뜻하지 않습니다. 브로커 설정만 준 테스트 컨텍스트에서 Kafka client의 기본 `acks=all`(정규화된 값 `-1`)을 확인했고 설정은 변경하지 않았습니다. 운영 환경의 override·ISR·topic 설정과 실제 전달 확인은 별도 검증 대상입니다. `acks=0`이면 완료해도 offset은 `-1`이고 브로커 수신 확인이 없습니다.
+`outcome=completed`는 producer의 설정에 따른 Future 완료이며 consumer·DB 반영을 뜻하지 않습니다. 브로커 설정만 준 테스트 컨텍스트에서는 Kafka client의 기본 `acks=all`(정규화된 값 `-1`)을 확인했습니다. local profile은 `acks=all`과 idempotence를 명시하며 실제 producer 설정·partition 0/offset 0 완료와 Kafka 수신을 확인했습니다. 운영 환경의 override·ISR·topic 설정은 별도 검증 대상입니다. `acks=0`이면 완료해도 offset은 `-1`이고 브로커 수신 확인이 없습니다.
 
-Adapter 테스트는 입력 계약·Future 완료 전/성공/실패·timeout·예외 전파·안전한 결과 로그·앱 설정을 검증합니다. 실제 KafkaTemplate과 MockProducer의 callback도 확인하며 실제 MQTT/Kafka 전달, 브로커 ACK, 재연결·장애 복구와 장비부터 DB까지의 연결은 별도 통합 검증 대상입니다. 관련 작업은 [Issue #8](https://github.com/vvineey/ev-charging-orchestrator/issues/8)입니다.
+Adapter 테스트는 입력 계약·Future 완료 전/성공/실패·timeout·예외 전파·안전한 결과 로그·앱 설정을 검증합니다. 실제 KafkaTemplate과 MockProducer의 callback도 확인합니다. [Issue #14](https://github.com/vvineey/ev-charging-orchestrator/issues/14)의 로컬 환경에서는 실제 MQTT→Kafka 한 건 전달, 앱 계정의 Flyway 시작, DB·Kafka 재시작 후 스키마·토픽·입력 기록 유지까지 확인했습니다. 앱을 실행한 채 브로커가 끊겼을 때의 재연결·consumer 장애 복구·장비부터 DB까지의 연결은 후속 검증입니다. 발행 관찰 구현은 [Issue #8](https://github.com/vvineey/ev-charging-orchestrator/issues/8)입니다.
 
 ## 개발 단계
 
