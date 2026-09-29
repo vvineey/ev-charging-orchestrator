@@ -8,7 +8,7 @@ import org.springframework.context.annotation.Import;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-@SpringBootTest(properties = {
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE, properties = {
         "mqtt.url=tcp://localhost:1883",
         "mqtt.topic=charger/telemetry",
         "mqtt.client-id=worker-must-not-connect",

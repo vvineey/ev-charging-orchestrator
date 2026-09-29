@@ -61,7 +61,8 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
-@SpringBootTest(properties = {"spring.kafka.bootstrap-servers=unused:9092", "telemetry.kafka-topic=unused-topic",
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
+        properties = {"spring.kafka.bootstrap-servers=unused:9092", "telemetry.kafka-topic=unused-topic",
         "spring.kafka.listener.auto-startup=false"})
 @Import({PostgreSqlTestConfiguration.class, KafkaTelemetryConsumerIntegrationTest.KafkaConfiguration.class})
 @ExtendWith(OutputCaptureExtension.class)

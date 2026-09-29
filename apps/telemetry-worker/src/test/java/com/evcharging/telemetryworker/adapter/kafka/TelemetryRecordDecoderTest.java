@@ -18,7 +18,7 @@ import java.util.stream.Stream;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-@SpringBootTest
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
 @Import(PostgreSqlTestConfiguration.class)
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class TelemetryRecordDecoderTest {
