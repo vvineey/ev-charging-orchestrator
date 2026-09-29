@@ -1,5 +1,6 @@
-package com.evcharging.telemetryworker;
+package com.evcharging.mqttadapter;
 
+import com.evcharging.mqttadapter.adapter.mqtt.MqttTelemetryMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -7,23 +8,17 @@ import org.springframework.context.ApplicationContext;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-@SpringBootTest(properties = {
-        "mqtt.url=tcp://localhost:1883",
-        "mqtt.topic=charger/telemetry",
-        "mqtt.client-id=worker-must-not-connect",
-        "spring.kafka.bootstrap-servers=localhost:9092",
-        "telemetry.kafka-topic=charger.telemetry"
-})
-class TelemetryWorkerApplicationTest {
+@SpringBootTest
+class MqttAdapterApplicationTest {
 
     @Autowired
     private ApplicationContext context;
 
     @Test
-    void startsWithoutMqttIngressEvenWhenLegacySettingsArePresent() {
+    void startsWithoutBrokerSettings() {
+        assertThat(context.getBeansOfType(MqttTelemetryMapper.class)).hasSize(1);
         assertThat(context.containsBean("mqttTelemetryFlow")).isFalse();
         assertThat(context.containsBean("mqttClientFactory")).isFalse();
-        assertThat(context.containsBean("mqttTelemetryMapper")).isFalse();
         assertThat(context.containsBean("kafkaTelemetryEventPublisher")).isFalse();
     }
 }

@@ -1,10 +1,12 @@
-package com.evcharging.telemetryworker.adapter.mqtt;
+package com.evcharging.mqttadapter.adapter.mqtt;
 
 import com.evcharging.messaging.contract.ChargerTelemetryPayload;
 import com.evcharging.messaging.contract.ChargerTelemetryReceived;
 import com.evcharging.messaging.contract.DomainEventEnvelope;
 import tools.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -44,10 +46,10 @@ class MqttTelemetryMapperTest {
         assertThat(event.payload().current()).isEqualByComparingTo("5.0");
     }
 
-    @Test
-    void mapsBoundaryChargerNumbersToEvseIds() {
-        assertThat(MAPPER.toEvent(validPayload(1)).evseId()).isEqualTo(1);
-        assertThat(MAPPER.toEvent(validPayload(5)).evseId()).isEqualTo(5);
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2, 3, 4, 5})
+    void mapsAllFiveChargerNumbersToEvseIds(int chargerNo) {
+        assertThat(MAPPER.toEvent(validPayload(chargerNo)).evseId()).isEqualTo(chargerNo);
     }
 
     @Test

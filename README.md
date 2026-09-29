@@ -2,7 +2,7 @@
 
 충전사업자(CPO)를 위한 통합 운영 플랫폼을 설계·구현하는 프로젝트입니다. 충전기 상태 관제부터 거래 세션, 요금 계산, 결제, AI 전력 스케줄과 원격 제어까지 하나의 업무 흐름으로 연결하는 것이 목표입니다. Raspberry Pi는 센서·통신 경로를 검증하는 축소형 장비이며, 상용 충전기 연동은 OCPP 2.0.1 Gateway와 시뮬레이터로 별도 검증합니다.
 
-> **현재 구현 범위:** 공통 telemetry 이벤트 계약, MQTT payload 검증·변환, Kafka 발행 코드와 단위 테스트가 있습니다. Kafka 소비자·조회 모델, 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 아직 구현하거나 통합 검증하지 않았습니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
+> **현재 구현 범위:** 공통 telemetry 이벤트 계약과 별도 `apps/mqtt-adapter` 앱의 MQTT payload 검증·변환·Kafka 발행 호출 코드 및 테스트가 있습니다. `telemetry-worker`에는 MQTT 입력 코드가 없으며 실행 앱 골격만 있습니다. Kafka 소비자·조회 모델, 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 아직 구현하거나 통합 검증하지 않았습니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
 
 ## 해결하려는 문제
 
@@ -105,6 +105,45 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 | Observability | Micrometer, OpenTelemetry, CloudWatch | API·브로커·DB·컨테이너 관측 |
 | Test | JUnit 5, Testcontainers, Toxiproxy | 통합 환경과 장애 조건 재현 |
 | Load test | k6 및 전용 OCPP Simulator | API·WebSocket·충전기 이벤트 부하 분리 |
+
+## 실행 앱과 공통 모듈
+
+| 경로 | 현재 구현과 책임 |
+|---|---|
+| `apps/mqtt-adapter` | MQTT 연결·구독·재연결, 입력 검증·EVSE 매핑, 공통 이벤트 생성·Kafka 발행 호출 |
+| `apps/telemetry-worker` | 실행 앱 골격. 공통 상태·계측 Kafka 소비와 조회 모델 처리는 후속 구현 |
+| `apps/ocpp-gateway` | 실행 앱 골격. OCPP 2.0.1 연결·정규화·발행·명령 전송은 후속 구현 |
+| `apps/control-plane` | 실행 앱 골격. 사용자·운영자 업무 API는 후속 구현 |
+| `apps/ai-worker` | 실행 앱 골격. RabbitMQ 계산 작업 처리는 후속 구현 |
+| `apps/charger-simulator` | 실행 앱 골격. 장비 입력·장애 시나리오 재현은 후속 구현 |
+| `modules/messaging-contract` | envelope v1, telemetry payload, EVSE 식별자와 계약 검증. MQTT·Kafka 구현에 의존하지 않음 |
+| `modules/charging-domain`, `modules/test-support` | 공통 도메인·테스트 지원 모듈 골격 |
+
+실행 앱은 서로 직접 의존하지 않고 공통 모듈을 사용합니다. MQTT 설정과 Paho·Spring Integration MQTT·Kafka publisher 의존성은 `mqtt-adapter`가 소유합니다.
+
+## 로컬 실행과 검증
+
+Java 21 환경에서 프로젝트 루트의 서로 다른 터미널로 실행합니다. 설정이 없으면 Adapter는 브로커에 연결하지 않고 시작합니다. worker에는 MQTT 설정을 전달해도 MQTT 입력이 활성화되지 않습니다.
+
+```powershell
+.\gradlew.bat :apps:mqtt-adapter:bootRun
+.\gradlew.bat :apps:telemetry-worker:bootRun
+```
+
+MQTT 수신을 활성화하려면 MQTT·Kafka 브로커를 준비하고 Adapter에 다음 설정을 전달합니다. 예시 주소와 clientId는 로컬 검증용입니다.
+
+```powershell
+.\gradlew.bat :apps:mqtt-adapter:bootRun --args="--mqtt.url=tcp://localhost:1883 --mqtt.topic=charger/telemetry --mqtt.client-id=mqtt-adapter-local --spring.kafka.bootstrap-servers=localhost:9092 --telemetry.kafka-topic=charger.telemetry --spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer --spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer"
+```
+
+`mqtt.url`, `mqtt.topic`, `spring.kafka.bootstrap-servers`, `telemetry.kafka-topic`가 모두 설정되어야 MQTT 입력 흐름이 생성됩니다. 기존 `mqtt.client-id` 설정 키와 명시한 값은 그대로 적용되며, 생략 시 기본값 `telemetry-worker`도 호환성을 위해 유지합니다. 기존 자동 재연결·clean session 설정도 유지합니다. 이전 worker의 MQTT 설정을 새 Adapter에 옮기고, 이동 전 worker와 Adapter를 같은 MQTT 구독으로 동시에 실행하지 않습니다.
+
+```powershell
+.\gradlew.bat :apps:mqtt-adapter:test :apps:telemetry-worker:test
+.\gradlew.bat test
+```
+
+테스트는 입력 계약·Kafka 전송 호출·앱 시작을 검증합니다. 실제 MQTT/Kafka 전달, 브로커 ACK, 재연결·장애 복구, DB·장비 연동은 별도 통합 검증 대상입니다. Kafka 발행 Future의 성공·실패 관찰은 [Issue #8](https://github.com/vvineey/ev-charging-orchestrator/issues/8)에서 진행합니다.
 
 ## 개발 단계
 
