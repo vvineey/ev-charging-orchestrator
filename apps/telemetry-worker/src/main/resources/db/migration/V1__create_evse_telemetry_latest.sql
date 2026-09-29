@@ -8,6 +8,6 @@ CREATE TABLE evse_telemetry_latest (
     occurred_at TIMESTAMPTZ(6) NOT NULL,
     received_at TIMESTAMPTZ(6) NOT NULL,
     last_event_id UUID NOT NULL,
-    updated_at TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ(6) NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (station_id, evse_id)
 );

@@ -145,7 +145,9 @@ MQTT 수신을 활성화하려면 MQTT·Kafka 브로커를 준비하고 Adapter�
 
 worker 테스트는 Docker가 실행 중이어야 하며 Testcontainers가 `postgres:18.3-alpine`을 시작·종료합니다. Docker를 사용할 수 없을 때 실제 DB 검증을 자동으로 건너뛰지 않습니다. macOS·Linux에서는 `./gradlew :apps:telemetry-worker:test`로 실행합니다.
 
-최신 상태는 `(station_id, evse_id)`별 한 행입니다. 더 최신인 `occurredAt`, 이어 `receivedAt`만 반영하고 두 시각이 모두 같으면 기존 행을 유지합니다. 저장·비교 시각은 UTC microsecond로 절삭하며 원본 이벤트는 변경하지 않습니다. 중복·과거 입력은 계측값·`last_event_id`·`updated_at`을 바꾸지 않습니다. 계측값은 BigDecimal과 PostgreSQL NUMERIC으로 저장합니다. 같은 이벤트의 재전달 처리와 MQTT 원천 중복 식별은 다르며, 이 저장 방식은 결제·누적 계산의 중복 실행 방지를 제공하지 않습니다.
+최신 상태는 `(station_id, evse_id)`별 한 행입니다. 더 최신인 `occurredAt`, 이어 `receivedAt`만 반영하고 두 시각이 모두 같으면 기존 행을 유지합니다. 저장·비교 시각은 UTC microsecond로 절삭하며 원본 이벤트는 변경하지 않습니다. 재전달은 eventId·두 시각·payload를 보존한다는 전제이며, 이때 계측값·`last_event_id`·`updated_at`을 바꾸지 않습니다. 과거 입력도 기존 행을 유지합니다. 계측값은 BigDecimal과 PostgreSQL NUMERIC으로 저장합니다. 같은 이벤트의 재전달 처리와 MQTT 원천 중복 식별은 다르며, 이 저장 방식은 결제·누적 계산의 중복 실행 방지를 제공하지 않습니다.
+
+`updated_at`은 반영 시 PostgreSQL의 `clock_timestamp()`로 기록합니다. 같은 트랜잭션의 연속 갱신도 각각의 처리 시각을 기록하며 무시한 입력은 변경하지 않습니다. 같은 eventId에 변경된 시각·내용을 넣은 사건의 거절 정책은 별도 계약 검토 대상으로 남깁니다.
 
 저장 서비스는 아직 Kafka listener나 HTTP API와 연결되지 않았습니다. 실제 PostgreSQL에서 신규·최신·중복·과거·동률·정밀도 왕복·동시 입력과 저장 직후 SQL 실패 rollback을 검증합니다. 관련 작업은 [Issue #12](https://github.com/vvineey/ev-charging-orchestrator/issues/12)입니다.
 

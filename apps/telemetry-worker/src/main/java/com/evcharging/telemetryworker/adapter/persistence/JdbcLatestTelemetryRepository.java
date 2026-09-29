@@ -26,7 +26,7 @@ public class JdbcLatestTelemetryRepository implements LatestTelemetryRepository 
                 occurred_at = EXCLUDED.occurred_at,
                 received_at = EXCLUDED.received_at,
                 last_event_id = EXCLUDED.last_event_id,
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = clock_timestamp()
             WHERE EXCLUDED.occurred_at > evse_telemetry_latest.occurred_at
                OR (EXCLUDED.occurred_at = evse_telemetry_latest.occurred_at
                    AND EXCLUDED.received_at > evse_telemetry_latest.received_at)

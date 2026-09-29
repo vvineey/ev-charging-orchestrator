@@ -17,7 +17,9 @@ import org.springframework.context.annotation.Import;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -48,6 +50,9 @@ class LatestTelemetryPersistenceTest {
 
     @Autowired
     private Flyway flyway;
+
+    @Autowired
+    private PlatformTransactionManager transactions;
 
     @MockitoSpyBean
     private JdbcLatestTelemetryRepository repository;
@@ -97,6 +102,28 @@ class LatestTelemetryPersistenceTest {
         assertThat(row.receivedAt()).isEqualTo(Instant.parse("2026-09-29T00:00:02Z"));
         assertThat(row.updatedAt()).isAfter(Instant.parse("2020-01-01T00:00:00Z"));
         assertThat(count()).isEqualTo(1);
+    }
+
+    @Test
+    void processingTimeAdvancesForAcceptedWritesInOneTransaction() {
+        new TransactionTemplate(transactions).executeWithoutResult(status -> {
+            var transactionStart = jdbc.sql("SELECT CURRENT_TIMESTAMP")
+                    .query(OffsetDateTime.class).single().toInstant();
+            service.store(event(1, OBSERVED, RECEIVED, "120.25"));
+            var first = read(STATION, 1);
+            assertThat(first.updatedAt()).isAfter(transactionStart);
+
+            var newer = event(2, OBSERVED.plusSeconds(1), RECEIVED.plusSeconds(1), "99.875");
+            assertThat(service.store(newer)).isTrue();
+            var updated = read(STATION, 1);
+            assertThat(updated.updatedAt()).isAfter(first.updatedAt());
+            assertThat(updated.eventId()).isEqualTo(new UUID(0, 2));
+            assertThat(updated.power()).isEqualByComparingTo("99.875");
+
+            assertThat(service.store(newer)).isFalse();
+            assertThat(read(STATION, 1)).isEqualTo(updated);
+        });
+        assertThat(read(STATION, 1).eventId()).isEqualTo(new UUID(0, 2));
     }
 
     @Test
