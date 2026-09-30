@@ -2,7 +2,7 @@
 
 충전사업자(CPO)를 위한 통합 운영 플랫폼을 설계·구현하는 프로젝트입니다. 충전기 상태 관제부터 거래 세션, 요금 계산, 결제, AI 전력 스케줄과 원격 제어까지 하나의 업무 흐름으로 연결하는 것이 목표입니다. Raspberry Pi는 센서·통신 경로를 검증하는 축소형 장비이며, 상용 충전기 연동은 OCPP 2.0.1 Gateway와 시뮬레이터로 별도 검증합니다.
 
-> **현재 구현 범위:** 공통 telemetry 이벤트 계약과 별도 `apps/mqtt-adapter`의 MQTT 검증·변환·Kafka 발행 결과 관찰을 구현했습니다. `telemetry-worker`는 Kafka 동기 소비·계약 검증·JDBC/Flyway 최신 상태 저장·실패 정지와 같은 그룹 재시작, 내부 HTTPS 목록·단건 조회를 제공합니다. `control-plane`은 내부 HTTPS를 호출해 운영자용 목록·단건 조회를 제공합니다. 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 후속입니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
+> **현재 구현 범위:** MQTT telemetry의 수집·Kafka 발행·최신 상태 저장·HTTPS 조회와 운영자 조회를 제공합니다. `ocpp-gateway`는 첫 등록 충전기의 OCPP 2.0.1 WSS/Basic 연결에서 `TransactionEvent`를 받아 거래 전용 Kafka record로 발행합니다. 거래 Inbox·세션 복구·청구·결제, RabbitMQ AI 작업과 OCPP의 다른 업무 흐름은 후속입니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
 
 ## 해결하려는 문제
 
@@ -112,7 +112,7 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 |---|---|
 | `apps/mqtt-adapter` | MQTT 연결·구독·재연결, 입력 검증·EVSE 매핑, 공통 이벤트 생성·Kafka 발행·Future 결과 관찰 |
 | `apps/telemetry-worker` | Kafka envelope v1 검증·동기 소비·PostgreSQL 최신 상태 저장·조건부 갱신·실패 정지·내부 HTTPS 조회 |
-| `apps/ocpp-gateway` | 실행 앱 골격. OCPP 2.0.1 연결·정규화·발행·명령 전송은 후속 구현 |
+| `apps/ocpp-gateway` | 첫 등록 충전기 WSS/Basic 수신, 거래 사건 검증·보존형 Kafka 발행. Inbox·명령·다중 충전기 등록은 후속 |
 | `apps/control-plane` | 운영자 최신 telemetry 목록·단건 API와 worker 내부 HTTPS 조회 연결 구현. 그 밖의 업무 API는 후속 구현 |
 | `apps/ai-worker` | 실행 앱 골격. RabbitMQ 계산 작업 처리는 후속 구현 |
 | `apps/charger-simulator` | 실행 앱 골격. 장비 입력·장애 시나리오 재현은 후속 구현 |
@@ -153,11 +153,19 @@ Windows에서는 파일 복사에 `Copy-Item .env.example .env`, 앱 실행에 `
 
 PostgreSQL 초기화 스크립트는 빈 volume에서 DB와 앱 계정 `telemetry_app`의 소유권을 준비합니다. 앱 계정은 superuser·DB 생성·역할 생성 권한이 없으며, 이 계정으로 Flyway가 업무 테이블을 생성합니다. DB 설정은 `SPRING_DATASOURCE_*`를 사용합니다. 과거 `DB_URL` 등의 별칭은 지원하지 않습니다. 초기화 스크립트는 데이터가 있는 volume에 재실행되지 않으므로 `.env`의 초기 계정·비밀번호 변경만으로 기존 DB 비밀번호가 바뀌지 않습니다. 기존 Flyway V1을 가진 다른 DB를 재사용하거나 자동 repair하지 않습니다.
 
-`kafka-init`은 `charger.telemetry`를 partition 1·복제 1·최소 ISR 1·delete·7일 보존으로 명시 생성합니다. broker의 자동 토픽 생성은 끕니다. 재실행 시 기존 토픽을 보존하며 설정 변경을 자동 적용하지 않습니다. 앱 producer는 String key/value·`acks=all`·idempotence를 사용합니다. 단일 broker 구성에서 복제 장애 복구나 종단 간 exactly-once를 보장하지 않습니다. Kafka cluster ID는 같은 volume을 재사용하는 동안 유지합니다.
+`kafka-init`은 `charger.telemetry`와 `charging.transaction.observed.v1`을 각각 partition 1·복제 1·최소 ISR 1·delete·7일 보존으로 명시 생성합니다. broker의 자동 토픽 생성은 끕니다. 재실행 시 기존 토픽을 보존하며 설정 변경을 자동 적용하지 않습니다. 앱 producer는 String key/value·`acks=all`·idempotence를 사용합니다. 단일 broker 구성에서 복제 장애 복구나 종단 간 exactly-once를 보장하지 않습니다. Kafka cluster ID는 같은 volume을 재사용하는 동안 유지합니다.
 
 local profile의 worker는 migration 후 `telemetry-current-state-v1`로 계속 소비하고 `https://localhost:18443`에서 내부 조회를 제공합니다. Kafka 주소·topic이 없는 기본 실행은 소비자가 활성화되지 않습니다. `docker compose stop`은 DB·Kafka 데이터를 보존합니다. volume 삭제는 데이터 삭제이므로 일반 중지 절차에 포함하지 않습니다.
 
 local profile을 사용하지 않을 때 Adapter는 브로커 설정 없이 시작할 수 있습니다. worker는 접근 가능한 PostgreSQL과 `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`, `TELEMETRY_TLS_KEY_STORE`, `TELEMETRY_TLS_KEY_STORE_PASSWORD`가 필요하며 설정 누락·접속·migration·TLS 실패 시 시작하지 않습니다. `mqtt.url`, `mqtt.topic`, `spring.kafka.bootstrap-servers`, `telemetry.kafka-topic`를 직접 전달하는 실행 방식도 유지합니다. 기본 `mqtt.client-id=telemetry-worker`와 자동 재연결·clean session은 기존대로이며 local profile은 client ID를 `mqtt-adapter-local`로 지정합니다. 이전 worker와 Adapter를 같은 MQTT 구독으로 동시에 실행하지 않습니다.
+
+### OCPP 거래 Gateway 첫 로컬 실행
+
+`ocpp-gateway`의 기본 실행은 수신 포트를 열지 않습니다. `local` profile은 루프백 WSS와 등록 충전기 한 대를 요구합니다. `.env`를 만든 다음 Java 21의 `JAVA_HOME`을 설정하고 `python3 scripts/create-local-ocpp-tls.py`를 실행하면 Git 제외 `secrets/`에 localhost 인증서와 키, `.env`에 임의 충전기 비밀번호가 만들어집니다. 이미 존재하는 OCPP 인증 자료나 비밀번호는 덮어쓰지 않습니다. 다른 터미널에서 `./gradlew :apps:ocpp-gateway:bootRun --args='--spring.profiles.active=local'`로 시작합니다. Windows에서는 `python`과 `.\gradlew.bat`을 사용합니다.
+
+시뮬레이터의 연결 주소는 `wss://localhost:19443/ocpp/CS-KEBA-OCPP2-00001`, subprotocol은 `ocpp2.0.1`입니다. 시뮬레이터는 `secrets/ocpp-gateway.crt`를 신뢰하고 Basic 사용자 이름을 `OCPP_CHARGING_STATION_ID`, 비밀번호를 생성된 `OCPP_STATION_PASSWORD`와 일치시켜야 합니다. Node 기반 SAP 시뮬레이터의 로컬 실행에는 `NODE_EXTRA_CA_CERTS`로 이 인증서를 지정할 수 있습니다. `OCPP_STATION_ID`와 허용 EVSE는 등록 설정에서만 결정됩니다. 유효 거래는 `charging.transaction.observed.v1`에 `stationId` key로 발행되고 **Kafka 발행 완료 뒤에만** OCPP 성공 응답을 돌려줍니다. 발행 결과가 불확실하면 OCPP 오류로 응답하므로 충전기 재전송으로 중복 record가 생길 수 있습니다. 중복 판정과 세션 확정은 후속 Inbox가 담당합니다.
+
+첫 거래 record는 `eventId`, `eventType=OcppTransactionEventObserved`, `schemaVersion=1`, `occurredAt`, `receivedAt`, `stationId`, `chargingStationId`, `payload`로 구성합니다. `payload`는 원천 거래 ID·순번·사건 종류·trigger reason과 EVSE/계량의 존재 여부·전체 meterValue 배열을 보존하며 `idToken`은 전달하지 않습니다. Gateway는 청구용 Wh를 선택하거나 telemetry v1을 채우지 않습니다. 첫 범위는 OCPP `customData` 확장을 거부하며 운영용 자격 교체·다중 충전기 등록·전체 OCPP 메시지 처리는 포함하지 않습니다.
 
 ### worker 내부 HTTPS 조회
 
