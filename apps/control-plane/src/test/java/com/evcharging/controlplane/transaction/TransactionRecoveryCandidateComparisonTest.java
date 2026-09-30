@@ -48,7 +48,8 @@ import static org.awaitility.Awaitility.await;
         properties = {"transaction.ingress.enabled=true", "spring.kafka.listener.auto-startup=false",
                 "transaction.recovery.experimental-session-confirmation-enabled=true"})
 @EmbeddedKafka(partitions = 1, topics = "transaction-comparison-bootstrap",
-        bootstrapServersProperty = "spring.kafka.bootstrap-servers")
+        bootstrapServersProperty = "spring.kafka.bootstrap-servers",
+        brokerProperties = "offsets.topic.num.partitions=1")
 class TransactionRecoveryCandidateComparisonTest {
     private static final EmbeddedPostgres POSTGRES;
     static {
