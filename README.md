@@ -2,7 +2,7 @@
 
 충전사업자(CPO)를 위한 통합 운영 플랫폼을 설계·구현하는 프로젝트입니다. 충전기 상태 관제부터 거래 세션, 요금 계산, 결제, AI 전력 스케줄과 원격 제어까지 하나의 업무 흐름으로 연결하는 것이 목표입니다. Raspberry Pi는 센서·통신 경로를 검증하는 축소형 장비이며, 상용 충전기 연동은 OCPP 2.0.1 Gateway와 시뮬레이터로 별도 검증합니다.
 
-> **현재 구현 범위:** 공통 telemetry 이벤트 계약과 별도 `apps/mqtt-adapter`의 MQTT 검증·변환·Kafka 발행 결과 관찰을 구현했습니다. `telemetry-worker`는 Kafka 동기 소비·계약 검증·JDBC/Flyway 최신 상태 저장·실패 정지와 같은 그룹 재시작, 내부 HTTPS 목록·단건 조회를 제공합니다. 운영자 API 연결, 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 후속입니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
+> **현재 구현 범위:** 공통 telemetry 이벤트 계약과 별도 `apps/mqtt-adapter`의 MQTT 검증·변환·Kafka 발행 결과 관찰을 구현했습니다. `telemetry-worker`는 Kafka 동기 소비·계약 검증·JDBC/Flyway 최신 상태 저장·실패 정지와 같은 그룹 재시작, 내부 HTTPS 목록·단건 조회를 제공합니다. `control-plane`은 내부 HTTPS를 호출해 운영자용 목록·단건 조회를 제공합니다. 충전 거래·결제, RabbitMQ AI 작업, OCPP Gateway의 실제 업무 흐름은 후속입니다. 아래의 그 밖의 흐름은 **목표 설계 또는 검토 중인 설계**입니다.
 
 ## 해결하려는 문제
 
@@ -113,7 +113,7 @@ Raspberry Pi 테스트베드 ─ MQTT Adapter ─┘      ├── 현재 상�
 | `apps/mqtt-adapter` | MQTT 연결·구독·재연결, 입력 검증·EVSE 매핑, 공통 이벤트 생성·Kafka 발행·Future 결과 관찰 |
 | `apps/telemetry-worker` | Kafka envelope v1 검증·동기 소비·PostgreSQL 최신 상태 저장·조건부 갱신·실패 정지·내부 HTTPS 조회 |
 | `apps/ocpp-gateway` | 실행 앱 골격. OCPP 2.0.1 연결·정규화·발행·명령 전송은 후속 구현 |
-| `apps/control-plane` | 실행 앱 골격. 사용자·운영자 업무 API는 후속 구현 |
+| `apps/control-plane` | 운영자 최신 telemetry 목록·단건 API와 worker 내부 HTTPS 조회 연결 구현. 그 밖의 업무 API는 후속 구현 |
 | `apps/ai-worker` | 실행 앱 골격. RabbitMQ 계산 작업 처리는 후속 구현 |
 | `apps/charger-simulator` | 실행 앱 골격. 장비 입력·장애 시나리오 재현은 후속 구현 |
 | `modules/messaging-contract` | envelope v1, telemetry payload, EVSE 식별자와 계약 검증. MQTT·Kafka 구현에 의존하지 않음 |
@@ -136,6 +136,8 @@ docker compose run --rm kafka-init
 ./gradlew :apps:telemetry-worker:bootRun --args='--spring.profiles.active=local'
 # worker를 실행한 채 별도 터미널에서 MQTT 입력을 받아 Kafka로 발행
 ./gradlew :apps:mqtt-adapter:bootRun --args='--spring.profiles.active=local'
+# 두 앱을 실행한 채 다른 터미널에서 운영자 조회 진입점을 시작
+./gradlew :apps:control-plane:bootRun --args='--spring.profiles.active=local'
 ```
 
 Windows에서는 파일 복사에 `Copy-Item .env.example .env`, 앱 실행에 `.\gradlew.bat`을 사용합니다. `bootRun`의 작업 디렉터리는 루트로 고정되어 있습니다. JAR도 루트에서 실행하거나 `LOCAL_ENV_FILE`을 `.env`의 절대 경로로 지정합니다. local profile에서 파일이 없으면 시작하지 않습니다.
@@ -145,6 +147,7 @@ Windows에서는 파일 복사에 `Copy-Item .env.example .env`, 앱 실행에 `
 | PostgreSQL 18.3 | `127.0.0.1:15432/telemetry_current` | `postgres:5432/telemetry_current` |
 | Kafka 4.1.1 | `127.0.0.1:19092` | `kafka:29092` |
 | MQTT Mosquitto 2.0 | `tcp://127.0.0.1:11883` | `tcp://mosquitto:1883` |
+| control-plane 운영자 API | `127.0.0.1:18580` | 별도 Compose 서비스 없음 |
 
 기본 Compose 프로젝트는 `evc-current-local`이며 DB·Kafka는 별도 named volume을 사용합니다. 다른 폴더의 기존 테스트 DB·Kafka와 공유하지 않습니다. 모든 공개 포트는 호스트 loopback에만 바인딩합니다. Kafka는 PLAINTEXT·단일 broker·복제/최소 ISR 1, MQTT는 익명 접속의 합성 데이터용 로컬 구성입니다. 원격 장비·운영 배포에는 별도 인증·암호화 설정이 필요합니다.
 
@@ -162,7 +165,7 @@ local profile을 사용하지 않을 때 Adapter는 브로커 설정 없이 시�
 - 단건: `GET /internal/v1/stations/{stationId}/evses/{evseId}/telemetry/latest`. `stationId`, `evseId`, `charging`, `power`(W), `voltage`(V), `current`(A), `occurredAt`, `receivedAt`, `updatedAt`, `lastEventId`를 반환합니다. 시각은 UTC ISO-8601과 DB microsecond 정밀도입니다.
 - 오류: 잘못된 입력은 400/`INVALID_TELEMETRY_QUERY`, 단건 없음은 404/`TELEMETRY_NOT_FOUND`, DB 조회 불가는 503/`TELEMETRY_QUERY_UNAVAILABLE`. 오류 JSON은 `code`, `message`만 포함합니다.
 
-조회는 commit된 마지막 관측을 읽습니다. Kafka 발행 직후 반영이나 장비 연결 상태를 보장하지 않고, 보고 중단을 충전 종료로 해석하지 않습니다. 데이터 갱신·발행·캐시·재시도를 추가하지 않습니다. control-plane의 운영자 API 중계는 다음 Feature입니다.
+조회는 commit된 마지막 관측을 읽습니다. Kafka 발행 직후 반영이나 장비 연결 상태를 보장하지 않고, 보고 중단을 충전 종료로 해석하지 않습니다. 데이터 갱신·발행·캐시·재시도를 추가하지 않습니다. control-plane의 운영자 API 연결은 아래에서 설명합니다.
 
 TLS 생성 스크립트는 기존 DB·Kafka 설정을 보존하면서 `.env`의 TLS 항목을 채우고, `secrets/`에 30일 유효한 localhost/127.0.0.1 개발용 인증서·PKCS12 키/신뢰 저장소를 만듭니다. 기존 TLS 자료가 있으면 덮어쓰지 않습니다. `.env`는 0600이며 인증 자료는 Git에서 제외합니다. 루트에서 JAR를 실행하면 상대 키 저장소 경로도 같은 루트를 기준으로 합니다. 다른 디렉터리에서는 `TELEMETRY_TLS_KEY_STORE`도 절대 file 경로로 지정합니다.
 
@@ -171,6 +174,15 @@ curl --cacert secrets/telemetry-worker.crt https://localhost:18443/internal/v1/s
 ```
 
 worker에는 평문 우회 connector가 없으며 TLS 자료 없이 HTTPS 서버가 시작하지 않습니다. 테스트는 실행 중 인증서를 생성·정리하고 실제 PostgreSQL·HTTPS로 정렬/정밀도·400/404/503·commit 가시성·신뢰/호스트명 거부·평문 거부를 확인합니다. 로컬 서버는 loopback에만 바인딩합니다. 서비스/운영자 인증·권한·외부 접근 통제·운영 인증서 발급/갱신 정책은 외부 배포 전에 별도로 결정합니다.
+
+### 운영자 최신 상태 조회
+
+- 목록: `GET http://127.0.0.1:18580/api/v1/stations/{stationId}/telemetry/latest`.
+- 단건: `GET http://127.0.0.1:18580/api/v1/stations/{stationId}/evses/{evseId}/telemetry/latest`.
+
+`control-plane`은 `telemetry-worker`의 DB에 접속하지 않고 두 내부 경로를 HTTPS로 호출합니다. local profile은 `.env`의 기존 신뢰 저장소로 서버 인증서의 체인과 호스트명을 검증하며 전체 호출 deadline은 **로컬 시험용 1초**입니다. 자동 재시도·응답 캐시·평문 우회는 없습니다. 저장된 관측과 숫자·UTC 시각·eventId를 그대로 반환하고, 잘못된 입력과 worker의 정의된 400/404는 전달합니다. worker 연결/TLS/deadline/해석 불가 응답은 503/`TELEMETRY_QUERY_UNAVAILABLE`로 구분합니다. 두 API의 오류 JSON은 `code`, `message`만 포함하며 내부 오류 정보는 포함하지 않습니다. worker가 중단돼도 오래된 캐시를 정상 최신 상태로 반환하지 않습니다.
+
+두 HTTP 서버는 현재 loopback 전용 개발용이며 운영자 인증·권한 정책이 없습니다. 외부 접근을 열기 전에 인증/접근 통제·운영 인증서 발급/갱신 정책을 별도로 결정해야 합니다. 기본 실행도 HTTPS origin·신뢰 자료·deadline 설정이 필요하고 누락·평문 origin은 시작 시 거부합니다. 다른 디렉터리에서 실행할 때는 `LOCAL_ENV_FILE`의 절대 경로와 `TELEMETRY_TLS_TRUST_STORE`의 절대 경로를 사용합니다.
 
 ```powershell
 .\gradlew.bat :apps:mqtt-adapter:test :apps:telemetry-worker:test
@@ -183,7 +195,7 @@ worker 테스트는 Docker가 실행 중이어야 하며 Testcontainers가 `post
 
 `updated_at`은 반영 시 PostgreSQL의 `clock_timestamp()`로 기록합니다. 같은 트랜잭션의 연속 갱신도 각각의 처리 시각을 기록하며 무시한 입력은 변경하지 않습니다. 같은 eventId에 변경된 시각·내용을 넣은 사건의 거절 정책은 별도 계약 검토 대상으로 남깁니다.
 
-저장 서비스는 Kafka listener와 연결됐으며 HTTP API는 후속입니다. 실제 PostgreSQL에서 신규·최신·중복·과거·동률·정밀도 왕복·동시 입력과 저장 직후 SQL 실패 rollback을 검증합니다. 저장소 작업은 [Issue #12](https://github.com/vvineey/ev-charging-orchestrator/issues/12)입니다.
+저장 서비스는 Kafka listener와 연결됐고 worker 내부 HTTPS·control-plane 운영자 조회도 구현했습니다. 실제 PostgreSQL에서 신규·최신·중복·과거·동률·정밀도 왕복·동시 입력과 저장 직후 SQL 실패 rollback을 검증했습니다. 저장소 작업은 [Issue #12](https://github.com/vvineey/ev-charging-orchestrator/issues/12)입니다.
 
 [Issue #17](https://github.com/vvineey/ev-charging-orchestrator/issues/17)의 소비자는 group `telemetry-current-state-v1`, String key/value, auto commit false, earliest, RECORD, concurrency 1을 사용합니다. 신규 그룹·유효 offset이 없는 경우 보존된 처음 기록부터 읽고, 같은 그룹은 commit 위치부터 재시작합니다. 동기 listener가 별도 DB transaction 서비스의 commit 완료 뒤 반환하면 container가 offset을 기록합니다. 두 commit은 원자적이지 않습니다.
 
@@ -202,7 +214,7 @@ Adapter 테스트는 입력 계약·Future 완료 전/성공/실패·timeout·�
 ## 개발 단계
 
 1. **구현:** 공통 telemetry 계약, 별도 MQTT 입력·Kafka 발행 결과 관찰, Kafka 소비·PostgreSQL 최신 상태 저장·내부 HTTPS 조회
-2. **다음 구현:** control-plane 운영자 API의 내부 HTTPS 연결
+2. **다음 구현:** 최소 OCPP 입력 계약과 상태·계측 매핑, 재구축 실험의 고정 입력·정답 정의
 3. **후속 설계:** OCPP 거래 계약, 안정적인 원천 식별자, 세션·요금·결제 경계 결정
 4. **핵심 실험:** 통신 단절 뒤 지연·중복·역순 거래 이벤트의 세션 복구와 중복 청구 방지
 5. Kafka 독립 소비자, RabbitMQ AI 작업과 결과 반영 구현
