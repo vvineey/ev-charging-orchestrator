@@ -21,7 +21,7 @@ class TransactionRecoveryRulesTest {
         var update = event(1, "Updated", 11500, false, false);
         var end = event(2, "Ended", 12500, false, false);
         var full = rules.evaluate(List.of(end, start, update));
-        assertThat(full.status()).isEqualTo("FINALIZED");
+        assertThat(full.status()).isEqualTo("CALCULATED");
         assertThat(full.energyWh()).isEqualByComparingTo("2500");
         assertThat(full.evseId()).isEqualTo(1);
         assertThat(full.startedAt()).isEqualTo(Instant.parse("2026-01-01T10:00:00Z"));

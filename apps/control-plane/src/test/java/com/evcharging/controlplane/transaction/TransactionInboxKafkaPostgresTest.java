@@ -44,7 +44,7 @@ import static org.awaitility.Awaitility.await;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
         properties = {"transaction.ingress.enabled=true", "spring.kafka.listener.auto-startup=false",
-                "transaction.recovery.experimental-session-confirmation-enabled=true"})
+                "transaction.recovery.experimental-candidate-calculation-enabled=true"})
 @EmbeddedKafka(partitions = 1, topics = "transaction-test-bootstrap",
         bootstrapServersProperty = "spring.kafka.bootstrap-servers",
         brokerProperties = "offsets.topic.num.partitions=1")
@@ -105,7 +105,7 @@ class TransactionInboxKafkaPostgresTest {
     }
 
     @Test
-    void reverseAndRedeliveryConvergeOnOneStoredSession() throws Exception {
+    void reverseAndRedeliveryConvergeOnOneProvisionalCandidate() throws Exception {
         String transactionId = "TX-REVERSE";
         send(transactionId, 2, "Ended", 12500, false, false);
         send(transactionId, 0, "Started", 10000, true, false);
@@ -113,12 +113,13 @@ class TransactionInboxKafkaPostgresTest {
         send(transactionId, 1, "Updated", 11500, false, false);
         start();
         waitForOffset(4);
-        awaitState(transactionId, "FINALIZED");
+        awaitState(transactionId, "PROVISIONAL");
         assertThat(eventCount(transactionId)).isEqualTo(3);
         assertThat(sessionCount(transactionId)).isEqualTo(1);
         assertThat(energy(transactionId)).isEqualByComparingTo("2500");
+        assertThat(candidateStatus(transactionId)).isEqualTo("PROVISIONAL");
         assertThat(jdbc.sql("""
-                SELECT evse_id FROM recovered_transaction_session
+                SELECT evse_id FROM transaction_session_candidate
                 WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
                 """).param("id", transactionId).query(Integer.class).single()).isEqualTo(1);
 
@@ -129,6 +130,43 @@ class TransactionInboxKafkaPostgresTest {
         waitForOffset(4);
         assertThat(eventCount(transactionId)).isEqualTo(3);
         assertThat(sessionCount(transactionId)).isEqualTo(1);
+        assertThat(candidateStatus(transactionId)).isEqualTo("PROVISIONAL");
+    }
+
+    @Test
+    void lateSourceConflictInvalidatesProvisionalCandidateWithoutChangingItsEvidence() throws Exception {
+        String transactionId = "TX-LATE-CONFLICT";
+        send(transactionId, 0, "Started", 10000, true, false);
+        send(transactionId, 1, "Ended", 12500, false, false);
+        start();
+        waitForOffset(2);
+        awaitState(transactionId, "PROVISIONAL");
+        assertThat(candidateStatus(transactionId)).isEqualTo("PROVISIONAL");
+        assertThat(energy(transactionId)).isEqualByComparingTo("2500");
+
+        send(transactionId, 1, "Ended", 12600, false, false);
+        waitForOffset(3);
+        awaitState(transactionId, "HOLD_AFTER_PROVISIONAL");
+        assertThat(reason(transactionId)).isEqualTo("SOURCE_CONFLICT");
+        assertThat(sessionCount(transactionId)).isEqualTo(1);
+        assertThat(candidateStatus(transactionId)).isEqualTo("INVALIDATED");
+        assertThat(candidateInvalidationReason(transactionId)).isEqualTo("SOURCE_CONFLICT");
+        assertThat(energy(transactionId)).isEqualByComparingTo("2500");
+        assertThat(eventCount(transactionId)).isEqualTo(2);
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_conflict
+                WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single()).isEqualTo(1);
+
+        send(transactionId, 1, "Ended", 12600, false, false);
+        waitForOffset(4);
+        assertThat(state(transactionId)).isEqualTo("HOLD_AFTER_PROVISIONAL");
+        assertThat(candidateStatus(transactionId)).isEqualTo("INVALIDATED");
+        assertThat(sessionCount(transactionId)).isEqualTo(1);
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_conflict
+                WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single()).isEqualTo(1);
     }
 
     @Test
@@ -141,7 +179,7 @@ class TransactionInboxKafkaPostgresTest {
         assertThat(reason(missing)).isEqualTo("MISSING_SEQUENCE");
         assertThat(sessionCount(missing)).isZero();
         send(missing, 1, "Updated", 11500, false, false);
-        awaitState(missing, "FINALIZED");
+        awaitState(missing, "PROVISIONAL");
         assertThat(energy(missing)).isEqualByComparingTo("2500");
 
         String conflict = "TX-CONFLICT";
@@ -186,7 +224,7 @@ class TransactionInboxKafkaPostgresTest {
                 throw new IllegalStateException("injected_after_database_commit_before_offset_commit");
             }
         });
-        awaitState(transactionId, "FINALIZED");
+        awaitState(transactionId, "PROVISIONAL");
         await().atMost(Duration.ofSeconds(25)).untilAsserted(() -> {
             assertThat(injected.get()).isTrue();
             assertThat(offset()).isEqualTo(1);
@@ -201,6 +239,7 @@ class TransactionInboxKafkaPostgresTest {
         assertThat(eventCount(transactionId)).isEqualTo(2);
         assertThat(sessionCount(transactionId)).isEqualTo(1);
         assertThat(energy(transactionId)).isEqualByComparingTo("2500");
+        assertThat(candidateStatus(transactionId)).isEqualTo("PROVISIONAL");
     }
 
     @Test
@@ -219,7 +258,7 @@ class TransactionInboxKafkaPostgresTest {
                 CrashAfterTransactionCommitProcess.class.getName(),
                 "--spring.kafka.listener.auto-startup=false",
                 "--transaction.ingress.enabled=true",
-                "--transaction.recovery.experimental-session-confirmation-enabled=true",
+                "--transaction.recovery.experimental-candidate-calculation-enabled=true",
                 "--transaction.kafka-topic=" + topic,
                 "--transaction.test.group-id=" + groupId,
                 "--spring.kafka.consumer.properties[session.timeout.ms]=6000",
@@ -240,7 +279,7 @@ class TransactionInboxKafkaPostgresTest {
                 process.waitFor(10, TimeUnit.SECONDS);
             }
         }
-        awaitState(transactionId, "FINALIZED");
+        awaitState(transactionId, "PROVISIONAL");
         assertThat(sessionCount(transactionId)).isEqualTo(1);
         assertThat(offset()).isEqualTo(1);
 
@@ -249,6 +288,7 @@ class TransactionInboxKafkaPostgresTest {
         assertThat(eventCount(transactionId)).isEqualTo(2);
         assertThat(sessionCount(transactionId)).isEqualTo(1);
         assertThat(energy(transactionId)).isEqualByComparingTo("2500");
+        assertThat(candidateStatus(transactionId)).isEqualTo("PROVISIONAL");
     }
 
     private void start() {
@@ -345,12 +385,22 @@ class TransactionInboxKafkaPostgresTest {
     }
 
     private long sessionCount(String transactionId) {
-        return jdbc.sql("SELECT count(*) FROM recovered_transaction_session WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id")
+        return jdbc.sql("SELECT count(*) FROM transaction_session_candidate WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id")
                 .param("id", transactionId).query(Long.class).single();
     }
 
     private BigDecimal energy(String transactionId) {
-        return jdbc.sql("SELECT energy_wh FROM recovered_transaction_session WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id")
+        return jdbc.sql("SELECT energy_wh FROM transaction_session_candidate WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id")
                 .param("id", transactionId).query(BigDecimal.class).single();
+    }
+
+    private String candidateStatus(String transactionId) {
+        return jdbc.sql("SELECT candidate_status FROM transaction_session_candidate WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id")
+                .param("id", transactionId).query(String.class).single();
+    }
+
+    private String candidateInvalidationReason(String transactionId) {
+        return jdbc.sql("SELECT invalidation_reason FROM transaction_session_candidate WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id")
+                .param("id", transactionId).query(String.class).single();
     }
 }

@@ -129,9 +129,9 @@ class JdbcTransactionInbox {
                 .param("transactionId", event.transactionId()).update();
     }
 
-    void insertSession(ObservedTransactionRecord event, TransactionRecoveryRules.Outcome result) {
+    void insertCandidate(ObservedTransactionRecord event, TransactionRecoveryRules.Outcome result) {
         jdbc.sql("""
-                INSERT INTO recovered_transaction_session
+                INSERT INTO transaction_session_candidate
                   (charging_station_id, transaction_id, station_id, evse_id, started_at, ended_at, energy_wh)
                 VALUES (:chargingStationId, :transactionId, :stationId, :evseId, :startedAt, :endedAt, :energyWh)
                 ON CONFLICT DO NOTHING
@@ -143,5 +143,18 @@ class JdbcTransactionInbox {
                 .param("startedAt", OffsetDateTime.ofInstant(result.startedAt(), java.time.ZoneOffset.UTC))
                 .param("endedAt", OffsetDateTime.ofInstant(result.endedAt(), java.time.ZoneOffset.UTC))
                 .param("energyWh", result.energyWh()).update();
+    }
+
+    void invalidateCandidate(ObservedTransactionRecord event, String reason) {
+        jdbc.sql("""
+                UPDATE transaction_session_candidate
+                SET candidate_status = 'INVALIDATED', invalidated_at = clock_timestamp(),
+                    invalidation_reason = :reason
+                WHERE charging_station_id = :chargingStationId AND transaction_id = :transactionId
+                  AND candidate_status = 'PROVISIONAL'
+                """)
+                .param("reason", reason)
+                .param("chargingStationId", event.chargingStationId())
+                .param("transactionId", event.transactionId()).update();
     }
 }
