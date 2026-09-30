@@ -111,12 +111,17 @@ class OcppGatewayToInboxIntegrationTest {
                             [2,"end","TransactionEvent",{"eventType":"Ended",
                             "timestamp":"2026-01-01T10:20:00Z","triggerReason":"EVDisconnected","seqNo":1,
                             "transactionInfo":{"transactionId":"TX-E2E"},"meterValue":[
+                            {"timestamp":"2026-01-01T10:00:00Z","sampledValue":[
+                            {"value":10000,"context":"Transaction.Begin",
+                            "measurand":"Energy.Active.Import.Register"}]},
                             {"timestamp":"2026-01-01T10:20:00Z","sampledValue":[
-                            {"value":12500,"measurand":"Energy.Active.Import.Register"},
-                            {"value":2.5,"measurand":"Energy.Active.Import.Register",
-                            "unitOfMeasure":{"unit":"kWh"}}]},
-                            {"timestamp":"2026-01-01T10:20:00Z","sampledValue":[{"value":12500}]},
-                            {"timestamp":"2026-01-01T10:20:00Z","sampledValue":[{"value":12500}]}]}]
+                            {"value":12500,"context":"Transaction.End",
+                            "measurand":"Energy.Active.Import.Register"},
+                            {"value":230,"measurand":"Voltage"}]},
+                            {"timestamp":"2026-01-01T10:20:00Z","sampledValue":[
+                            {"value":12.5,"context":"Transaction.End",
+                            "measurand":"Energy.Active.Import.Register",
+                            "unitOfMeasure":{"unit":"kWh"}}]}]}]
                             """, true).get(10, TimeUnit.SECONDS);
                     assertReply(replies);
                     await().atMost(Duration.ofSeconds(25)).untilAsserted(() -> {
@@ -124,6 +129,10 @@ class OcppGatewayToInboxIntegrationTest {
                                 SELECT status FROM transaction_inbox_state
                                 WHERE charging_station_id = 'CS-E2E' AND transaction_id = 'TX-E2E'
                                 """).query(String.class).single()).isEqualTo("HOLD");
+                        assertThat(jdbc.sql("""
+                                SELECT hold_reason FROM transaction_inbox_state
+                                WHERE charging_station_id = 'CS-E2E' AND transaction_id = 'TX-E2E'
+                                """).query(String.class).single()).isEqualTo("METER_POLICY_PENDING");
                         assertThat(jdbc.sql("""
                                 SELECT count(*) FROM transaction_inbox_event
                                 WHERE charging_station_id = 'CS-E2E' AND transaction_id = 'TX-E2E'
@@ -191,7 +200,12 @@ class OcppGatewayToInboxIntegrationTest {
             String completedTransaction = """
                     SELECT transaction_id FROM transaction_inbox_event
                     WHERE charging_station_id = 'CS-KEBA-OCPP2-00001'
-                    GROUP BY transaction_id HAVING count(*) = 3 AND min(seq_no) = 0 AND max(seq_no) = 2
+                    GROUP BY transaction_id
+                    HAVING count(*) BETWEEN 2 AND 3
+                       AND min(seq_no) = 0 AND max(seq_no) = count(*) - 1
+                       AND count(*) FILTER (WHERE event_type = 'Started' AND seq_no = 0) = 1
+                       AND count(*) FILTER (WHERE event_type = 'Ended') = 1
+                       AND max(seq_no) FILTER (WHERE event_type = 'Ended') = max(seq_no)
                     ORDER BY transaction_id LIMIT 1
                     """;
             await().atMost(Duration.ofSeconds(70)).untilAsserted(() ->
@@ -204,9 +218,15 @@ class OcppGatewayToInboxIntegrationTest {
                         """).param("id", transactionId).query(String.class).single()).isEqualTo("HOLD");
             });
             assertThat(jdbc.sql("""
+                    SELECT hold_reason FROM transaction_inbox_state
+                    WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                    """).param("id", transactionId).query(String.class).single())
+                    .isEqualTo("METER_POLICY_PENDING");
+            assertThat(jdbc.sql("""
                     SELECT jsonb_array_length(source_document->'payload'->'meterValue')
                     FROM transaction_inbox_event
-                    WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id AND seq_no = 2
+                    WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                      AND event_type = 'Ended'
                     """).param("id", transactionId).query(Integer.class).single()).isEqualTo(3);
             assertThat(jdbc.sql("""
                     SELECT count(*) FROM transaction_inbox_event

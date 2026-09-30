@@ -38,11 +38,73 @@ class TransactionRecoveryRulesTest {
         assertThat(rules.evaluate(List.of(start, end)).reason()).isEqualTo("MISSING_SEQUENCE");
         assertThat(rules.evaluate(List.of(start, event(1, "Ended", 9500, false, false))).reason())
                 .isEqualTo("INVALID_OR_AMBIGUOUS_METER");
-        assertThat(rules.evaluate(List.of(start, event(1, "Ended", 12500, false, true))).reason())
-                .isEqualTo("INVALID_OR_AMBIGUOUS_METER");
+        assertThat(rules.evaluate(List.of(start, event(1, "Ended", 12500, false, true))).energyWh())
+                .isEqualByComparingTo("2500");
         assertThat(rules.evaluate(List.of(event(0, "Started", null, true, false),
                 event(1, "Ended", 12500, false, false))).reason())
                 .isEqualTo("INVALID_OR_AMBIGUOUS_METER");
+    }
+
+    @Test
+    void selectsMatchingBoundaryValuesAcrossMixedMeterGroups() {
+        var start = event(0, "Started", 0, true, false);
+        var update = event(1, "Updated", 141, false, false);
+        var end = event(2, "Ended", null, false, false);
+        var meters = ((ObjectNode) end.payload()).putArray("meterValue");
+        addSample(meters.addObject(), "2026-01-01T10:00:00Z", "Transaction.Begin",
+                "0", "Wh", 0).put("location", "Outlet");
+        ObjectNode endSample = addSample(meters.addObject(), "2026-01-01T10:20:00Z",
+                "Transaction.End", "0.15545", "kWh", 0);
+        endSample.put("format", "Raw");
+        addSample(meters.addObject(), "2026-01-01T10:20:00Z", "Transaction.End",
+                "15545", "Wh", -2).remove("measurand");
+        ((tools.jackson.databind.node.ArrayNode) meters.get(2).get("sampledValue"))
+                .addObject().put("value", 230)
+                .put("measurand", "Voltage").put("context", "Sample.Periodic");
+
+        var outcome = rules.evaluate(List.of(end, update, start));
+        assertThat(outcome.status()).isEqualTo("CALCULATED");
+        assertThat(outcome.energyWh()).isEqualByComparingTo("155.45");
+    }
+
+    @Test
+    void holdsConflictingRepeatedBoundaryAndUnsupportedSource() {
+        var start = event(0, "Started", 10000, true, false);
+        var end = event(1, "Ended", 12500, false, false);
+        var meters = (tools.jackson.databind.node.ArrayNode) end.payload().get("meterValue");
+        addSample(meters.addObject(), "2026-01-01T10:20:00Z", "Transaction.End",
+                "12501", "Wh", 0);
+        assertThat(rules.evaluate(List.of(start, end)).reason()).isEqualTo("INVALID_OR_AMBIGUOUS_METER");
+
+        meters.remove(1);
+        ObjectNode second = addSample(meters.addObject(), "2026-01-01T10:20:00Z",
+                "Transaction.End", "12500", "Wh", 0);
+        second.put("phase", "L1");
+        assertThat(rules.evaluate(List.of(start, end)).reason()).isEqualTo("INVALID_OR_AMBIGUOUS_METER");
+
+        meters.remove(1);
+        second = addSample(meters.addObject(), "2026-01-01T10:20:00Z",
+                "Transaction.End", "12500", "Wh", 0);
+        second.put("location", "Body");
+        assertThat(rules.evaluate(List.of(start, end)).reason()).isEqualTo("INVALID_OR_AMBIGUOUS_METER");
+
+        meters.remove(1);
+        addSample(meters.addObject(), "2026-01-01T10:00:00Z", "Transaction.Begin",
+                "9999", "Wh", 0);
+        assertThat(rules.evaluate(List.of(start, end)).reason()).isEqualTo("INVALID_OR_AMBIGUOUS_METER");
+    }
+
+    @Test
+    void requiresExplicitBoundaryAndOrderedMeterTime() {
+        var start = event(0, "Started", 10000, true, false);
+        var end = event(1, "Ended", 12500, false, false);
+        ObjectNode endSample = (ObjectNode) end.payload().get("meterValue").get(0).get("sampledValue").get(0);
+        endSample.remove("context");
+        assertThat(rules.evaluate(List.of(start, end)).reason()).isEqualTo("INVALID_OR_AMBIGUOUS_METER");
+
+        endSample.put("context", "Transaction.End");
+        ((ObjectNode) end.payload().get("meterValue").get(0)).put("timestamp", "2026-01-01T09:59:59Z");
+        assertThat(rules.evaluate(List.of(start, end)).reason()).isEqualTo("INVALID_OR_AMBIGUOUS_METER");
     }
 
     @Test
@@ -130,5 +192,16 @@ class TransactionRecoveryRulesTest {
         });
         sample.put("measurand", "Energy.Active.Import.Register");
         sample.putObject("unitOfMeasure").put("unit", "Wh").put("multiplier", 0);
+    }
+
+    private ObjectNode addSample(ObjectNode meter, String time, String context,
+                                 String value, String unit, int multiplier) {
+        meter.put("timestamp", time);
+        ObjectNode sample = meter.putArray("sampledValue").addObject();
+        sample.put("value", new BigDecimal(value));
+        sample.put("context", context);
+        sample.put("measurand", "Energy.Active.Import.Register");
+        sample.putObject("unitOfMeasure").put("unit", unit).put("multiplier", multiplier);
+        return sample;
     }
 }
