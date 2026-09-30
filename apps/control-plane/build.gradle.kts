@@ -32,4 +32,6 @@ dependencies {
 tasks.test {
     // The crash fixture forks the actual app with the same test runtime dependencies.
     systemProperty("transaction.test.runtime-classpath", sourceSets.test.get().runtimeClasspath.asPath)
+    systemProperty("transaction.test.comparison-output",
+            layout.buildDirectory.file("experiment-results/exp-0002-candidate-correctness.json").get().asFile.absolutePath)
 }
