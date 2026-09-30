@@ -32,8 +32,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -86,7 +88,8 @@ class TransactionRecoveryCandidateComparisonTest {
     record Result(String state, Integer energyWh, int finalizedCount) { }
     record Scenario(String name, List<Event> arrival, Result expected) { }
     record Row(String scenario, List<Integer> arrivalSeqNo, List<Integer> arrivalSeconds, Result expected,
-               Result arrivalOrderA, boolean aMatches, Result windowB, boolean bMatches,
+               Result arrivalOrderA, boolean aMatches, Result guardedA, boolean guardedAMatches,
+               Result windowB, boolean bMatches, Result guardedB, boolean guardedBMatches,
                Result durableInboxC, boolean cMatches, int inboxEventCount, int conflictCount) { }
 
     @Test
@@ -123,6 +126,8 @@ class TransactionRecoveryCandidateComparisonTest {
                 for (Scenario scenario : scenarios) {
                     Result a = arrivalOrder(scenario.arrival());
                     Result b = fiveMinuteWindow(scenario.arrival());
+                    Result guardedA = commonFinalSafetyGate(scenario.arrival(), a);
+                    Result guardedB = commonFinalSafetyGate(scenario.arrival(), b);
                     Result c = durableResult(scenario.name());
                     int events = jdbc.sql("""
                             SELECT count(*) FROM transaction_inbox_event
@@ -134,13 +139,16 @@ class TransactionRecoveryCandidateComparisonTest {
                             """).param("id", scenario.name()).query(Long.class).single().intValue();
                     rows.add(new Row(scenario.name(), scenario.arrival().stream().map(Event::seqNo).toList(),
                             scenario.arrival().stream().map(Event::arrivalSecond).toList(), scenario.expected(),
-                            a, a.equals(scenario.expected()), b, b.equals(scenario.expected()),
+                            a, a.equals(scenario.expected()), guardedA, guardedA.equals(scenario.expected()),
+                            b, b.equals(scenario.expected()), guardedB, guardedB.equals(scenario.expected()),
                             c, c.equals(scenario.expected()), events, conflicts));
                 }
                 writeResults(rows);
                 assertThat(rows).hasSize(9);
                 assertThat(rows.stream().filter(Row::aMatches).count()).isEqualTo(3);
                 assertThat(rows.stream().filter(Row::bMatches).count()).isEqualTo(4);
+                assertThat(rows.stream().filter(Row::guardedAMatches).count()).isEqualTo(7);
+                assertThat(rows.stream().filter(Row::guardedBMatches).count()).isEqualTo(8);
                 assertThat(rows.stream().filter(Row::cMatches).count()).isEqualTo(9);
                 assertThat(rows.stream().filter(row -> row.scenario().equals("conflict_0_1_1_2"))
                         .findFirst().orElseThrow().conflictCount()).isEqualTo(1);
@@ -212,6 +220,30 @@ class TransactionRecoveryCandidateComparisonTest {
         batch.sort(Comparator.comparing(Event::occurredAt));
         ordered.addAll(batch);
         return arrivalOrder(ordered);
+    }
+
+    // Applied only to the final observed input set. It equalizes basic rejection rules for an
+    // order-handling comparison; it cannot undo any side effect an online A/B implementation made.
+    private Result commonFinalSafetyGate(List<Event> events, Result candidate) {
+        Map<Integer, Event> bySequence = new HashMap<>();
+        for (Event event : events) {
+            Event previous = bySequence.putIfAbsent(event.seqNo(), event);
+            if (previous != null && (!previous.stage().equals(event.stage())
+                    || !Objects.equals(previous.wh(), event.wh())
+                    || !previous.occurredAt().equals(event.occurredAt()))) {
+                return new Result("HOLD", null, 0);
+            }
+        }
+        int lastSequence = bySequence.keySet().stream().mapToInt(Integer::intValue).max().orElse(-1);
+        for (int sequence = 0; sequence <= lastSequence; sequence++) {
+            if (!bySequence.containsKey(sequence)) return new Result("HOLD", null, 0);
+        }
+        Event first = bySequence.get(0);
+        Event last = bySequence.get(lastSequence);
+        if (first == null || last == null || !"Started".equals(first.stage())
+                || !"Ended".equals(last.stage()) || first.wh() == null || last.wh() == null
+                || last.wh() < first.wh()) return new Result("HOLD", null, 0);
+        return candidate;
     }
 
     private Result durableResult(String transactionId) {
