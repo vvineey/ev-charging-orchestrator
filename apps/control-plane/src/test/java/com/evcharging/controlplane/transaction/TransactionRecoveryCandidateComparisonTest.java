@@ -159,6 +159,61 @@ class TransactionRecoveryCandidateComparisonTest {
         }
     }
 
+    @Test
+    void lateConflictingEndIsHeldAfterExperimentalSessionWasAlreadyWritten() throws Exception {
+        String transactionId = "late-conflict-" + UUID.randomUUID();
+        String topic = "transaction-late-conflict-" + UUID.randomUUID();
+        String groupId = "transaction-late-conflict-" + UUID.randomUUID();
+        String bootstrap = broker.getBrokersAsString();
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", bootstrap));
+             var producer = new KafkaProducer<String, String>(Map.of(
+                     ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap,
+                     ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.ACKS_CONFIG, "all"))) {
+            admin.createTopics(List.of(new NewTopic(topic, 1, (short) 1))).all().get(10, TimeUnit.SECONDS);
+            var container = factory.createContainer(topic);
+            container.getContainerProperties().setGroupId(groupId);
+            container.getContainerProperties().setPollTimeout(100);
+            container.getContainerProperties().setMessageListener((MessageListener<String, String>) listener::consume);
+            try {
+                container.start();
+                producer.send(new ProducerRecord<>(topic, 0, "ST-COMPARE",
+                        observed(transactionId, new Event(0, "Started", 10000, 0))))
+                        .get(10, TimeUnit.SECONDS);
+                await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
+                        assertThat(offset(admin, groupId, topic)).isEqualTo(1));
+                assertThat(durableResult(transactionId)).isEqualTo(new Result("PENDING", null, 0));
+
+                producer.send(new ProducerRecord<>(topic, 0, "ST-COMPARE",
+                        observed(transactionId, new Event(1, "Ended", 12500, 1))))
+                        .get(10, TimeUnit.SECONDS);
+                await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
+                        assertThat(offset(admin, groupId, topic)).isEqualTo(2));
+                assertThat(durableResult(transactionId)).isEqualTo(new Result("FINALIZED", 2500, 1));
+
+                producer.send(new ProducerRecord<>(topic, 0, "ST-COMPARE",
+                        observed(transactionId, new Event(1, "Ended", 12600, 2))))
+                        .get(10, TimeUnit.SECONDS);
+                await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
+                        assertThat(offset(admin, groupId, topic)).isEqualTo(3));
+                assertThat(durableResult(transactionId)).isEqualTo(new Result("HOLD", 2500, 1));
+                String rawStatus = jdbc.sql("""
+                        SELECT status FROM transaction_inbox_state
+                        WHERE charging_station_id = 'CS-COMPARE' AND transaction_id = :id
+                        """).param("id", transactionId).query(String.class).single();
+                assertThat(rawStatus).isEqualTo("HOLD_AFTER_FINALIZATION");
+                int conflicts = jdbc.sql("""
+                        SELECT count(*) FROM transaction_inbox_conflict
+                        WHERE charging_station_id = 'CS-COMPARE' AND transaction_id = :id
+                        """).param("id", transactionId).query(Long.class).single().intValue();
+                assertThat(conflicts).isEqualTo(1);
+            } finally {
+                container.stop();
+            }
+        }
+    }
+
     private List<Scenario> scenarios() {
         Event start = new Event(0, "Started", 10000, 0);
         Event update = new Event(1, "Updated", 11500, 1);
