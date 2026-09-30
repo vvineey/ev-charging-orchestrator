@@ -196,14 +196,14 @@ class TransactionInboxKafkaPostgresTest {
     }
 
     @Test
-    void actualMultipleMeterGroupsRemainPreservedButUnconfirmed() throws Exception {
+    void matchingMultipleMeterGroupsProduceOneProvisionalCandidate() throws Exception {
         String transactionId = "TX-MULTI-METER";
         send(transactionId, 0, "Started", 10000, true, false);
         send(transactionId, 1, "Ended", 12500, false, true);
         start();
-        awaitState(transactionId, "HOLD");
-        assertThat(reason(transactionId)).isEqualTo("INVALID_OR_AMBIGUOUS_METER");
-        assertThat(sessionCount(transactionId)).isZero();
+        awaitState(transactionId, "PROVISIONAL");
+        assertThat(energy(transactionId)).isEqualByComparingTo("2500");
+        assertThat(sessionCount(transactionId)).isEqualTo(1);
         assertThat(jdbc.sql("""
                 SELECT jsonb_array_length(source_document->'payload'->'meterValue')
                 FROM transaction_inbox_event
