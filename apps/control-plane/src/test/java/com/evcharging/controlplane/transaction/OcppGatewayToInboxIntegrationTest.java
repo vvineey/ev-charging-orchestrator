@@ -45,7 +45,8 @@ import static org.awaitility.Awaitility.await;
         properties = {"transaction.ingress.enabled=true",
                 "transaction.kafka-topic=charging.transaction.observed.v1"})
 @EmbeddedKafka(partitions = 1, topics = "charging.transaction.observed.v1",
-        bootstrapServersProperty = "spring.kafka.bootstrap-servers")
+        bootstrapServersProperty = "spring.kafka.bootstrap-servers",
+        brokerProperties = "offsets.topic.num.partitions=1")
 class OcppGatewayToInboxIntegrationTest {
     private static final EmbeddedPostgres POSTGRES;
     static {
