@@ -13,6 +13,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -29,6 +30,7 @@ import tools.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +75,7 @@ class TransactionInboxKafkaPostgresTest {
     @Autowired TransactionRecordListener listener;
     @Autowired @Qualifier("transactionKafkaListenerContainerFactory")
     ConcurrentKafkaListenerContainerFactory<String, String> factory;
+    @TempDir Path directory;
 
     private String topic;
     private AdminClient admin;
@@ -166,7 +169,7 @@ class TransactionInboxKafkaPostgresTest {
                 SELECT jsonb_array_length(source_document->'payload'->'meterValue')
                 FROM transaction_inbox_event
                 WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id AND seq_no = 1
-                """).param("id", transactionId).query(Integer.class).single()).isEqualTo(2);
+                """).param("id", transactionId).query(Integer.class).single()).isEqualTo(3);
     }
 
     @Test
@@ -192,6 +195,54 @@ class TransactionInboxKafkaPostgresTest {
 
         container.stop();
         container = null;
+        start(groupId, listener::consume);
+        waitForOffset(2);
+        assertThat(eventCount(transactionId)).isEqualTo(2);
+        assertThat(sessionCount(transactionId)).isEqualTo(1);
+        assertThat(energy(transactionId)).isEqualByComparingTo("2500");
+    }
+
+    @Test
+    void actualJvmHaltAfterDbCommitReplaysWithoutDuplicatingSession() throws Exception {
+        String transactionId = "TX-JVM-HALT";
+        String groupId = "transaction-test-" + UUID.randomUUID();
+        send(transactionId, 0, "Started", 10000, true, false);
+        start(groupId, listener::consume);
+        waitForOffset(1);
+        container.stop();
+        container = null;
+
+        send(transactionId, 1, "Ended", 12500, false, false);
+        var builder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-cp", System.getProperty("transaction.test.runtime-classpath"),
+                CrashAfterTransactionCommitProcess.class.getName(),
+                "--spring.kafka.listener.auto-startup=false",
+                "--transaction.ingress.enabled=true",
+                "--transaction.recovery.experimental-session-confirmation-enabled=true",
+                "--transaction.kafka-topic=" + topic,
+                "--transaction.test.group-id=" + groupId,
+                "--spring.kafka.consumer.properties[session.timeout.ms]=6000",
+                "--spring.kafka.consumer.properties[heartbeat.interval.ms]=1000");
+        builder.environment().put("SPRING_DATASOURCE_URL", POSTGRES.getJdbcUrl("postgres", "postgres"));
+        builder.environment().put("SPRING_DATASOURCE_USERNAME", "postgres");
+        builder.environment().put("SPRING_DATASOURCE_PASSWORD", "postgres");
+        builder.environment().put("SPRING_KAFKA_BOOTSTRAPSERVERS", broker.getBrokersAsString());
+        builder.redirectErrorStream(true).redirectOutput(directory.resolve("transaction-crash-process.log").toFile());
+        Process process = builder.start();
+        try {
+            assertThat(process.waitFor(45, TimeUnit.SECONDS))
+                    .as("child JVM must commit the session and halt before offset commit").isTrue();
+            assertThat(process.exitValue()).isEqualTo(137);
+        } finally {
+            if (process.isAlive()) {
+                process.destroyForcibly();
+                process.waitFor(10, TimeUnit.SECONDS);
+            }
+        }
+        awaitState(transactionId, "FINALIZED");
+        assertThat(sessionCount(transactionId)).isEqualTo(1);
+        assertThat(offset()).isEqualTo(1);
+
         start(groupId, listener::consume);
         waitForOffset(2);
         assertThat(eventCount(transactionId)).isEqualTo(2);
@@ -255,7 +306,10 @@ class TransactionInboxKafkaPostgresTest {
         if (wh != null) {
             var meters = payload.putArray("meterValue");
             addMeter(meters.addObject(), time, stage, wh);
-            if (extraMeter) addMeter(meters.addObject(), time, stage, wh);
+            if (extraMeter) {
+                addMeter(meters.addObject(), time, stage, wh);
+                addMeter(meters.addObject(), time, stage, wh);
+            }
         }
         return mapper.writeValueAsString(root);
     }
