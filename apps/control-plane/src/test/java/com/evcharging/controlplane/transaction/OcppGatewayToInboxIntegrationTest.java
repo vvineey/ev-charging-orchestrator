@@ -140,7 +140,7 @@ class OcppGatewayToInboxIntegrationTest {
                             WHERE charging_station_id = 'CS-E2E' AND transaction_id = 'TX-E2E' AND seq_no = 1
                             """).query(Boolean.class).single()).isFalse();
                     assertThat(jdbc.sql("""
-                            SELECT count(*) FROM recovered_transaction_session
+                            SELECT count(*) FROM transaction_session_candidate
                             WHERE charging_station_id = 'CS-E2E' AND transaction_id = 'TX-E2E'
                             """).query(Long.class).single()).isZero();
                 } finally {
@@ -215,7 +215,7 @@ class OcppGatewayToInboxIntegrationTest {
                       AND jsonb_exists(source_document->'payload', 'evse')
                     """).param("id", transactionId).query(Long.class).single()).isZero();
             assertThat(jdbc.sql("""
-                    SELECT count(*) FROM recovered_transaction_session
+                    SELECT count(*) FROM transaction_session_candidate
                     WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
                     """).param("id", transactionId).query(Long.class).single()).isZero();
         } finally {

@@ -8,14 +8,14 @@ import org.springframework.transaction.annotation.Transactional;
 class StoreTransactionObservation {
     private final JdbcTransactionInbox inbox;
     private final TransactionRecoveryRules rules;
-    private final boolean experimentalSessionConfirmation;
+    private final boolean experimentalCandidateCalculation;
 
     StoreTransactionObservation(JdbcTransactionInbox inbox, TransactionRecoveryRules rules,
-            @Value("${transaction.recovery.experimental-session-confirmation-enabled:false}")
-            boolean experimentalSessionConfirmation) {
+            @Value("${transaction.recovery.experimental-candidate-calculation-enabled:false}")
+            boolean experimentalCandidateCalculation) {
         this.inbox = inbox;
         this.rules = rules;
-        this.experimentalSessionConfirmation = experimentalSessionConfirmation;
+        this.experimentalCandidateCalculation = experimentalCandidateCalculation;
     }
 
     @Transactional
@@ -33,29 +33,34 @@ class StoreTransactionObservation {
                 holdConflict(event, state);
                 return;
             }
-            if ("FINALIZED".equals(state.status())) return;
+            if ("PROVISIONAL".equals(state.status())) return;
         }
-        if ("HOLD_CONFLICT".equals(state.status()) || "HOLD_AFTER_FINALIZATION".equals(state.status())) {
+        if ("HOLD_CONFLICT".equals(state.status()) || "HOLD_AFTER_PROVISIONAL".equals(state.status())) {
             return;
         }
         TransactionRecoveryRules.Outcome outcome = rules.evaluate(inbox.events(event));
-        if ("FINALIZED".equals(state.status()) && !"FINALIZED".equals(outcome.status())) {
-            inbox.updateState(event, "HOLD_AFTER_FINALIZATION", "LATE_INVALID_EVENT", null);
+        if ("PROVISIONAL".equals(state.status()) && !"CALCULATED".equals(outcome.status())) {
+            inbox.invalidateCandidate(event, "LATE_INVALID_EVENT");
+            inbox.updateState(event, "HOLD_AFTER_PROVISIONAL", "LATE_INVALID_EVENT", null);
             return;
         }
-        if ("FINALIZED".equals(outcome.status())) {
-            if (!experimentalSessionConfirmation) {
+        if ("CALCULATED".equals(outcome.status())) {
+            if (!experimentalCandidateCalculation) {
                 inbox.updateState(event, "HOLD", "METER_POLICY_PENDING", outcome.evseId());
                 return;
             }
-            inbox.insertSession(event, outcome);
+            inbox.insertCandidate(event, outcome);
+            inbox.updateState(event, "PROVISIONAL", null, outcome.evseId());
+            return;
         }
         inbox.updateState(event, outcome.status(), outcome.reason(), outcome.evseId());
     }
 
     private void holdConflict(ObservedTransactionRecord event, JdbcTransactionInbox.State previous) {
-        String status = "FINALIZED".equals(previous.status())
-                ? "HOLD_AFTER_FINALIZATION" : "HOLD_CONFLICT";
+        if ("HOLD_AFTER_PROVISIONAL".equals(previous.status())) return;
+        boolean provisional = "PROVISIONAL".equals(previous.status());
+        if (provisional) inbox.invalidateCandidate(event, "SOURCE_CONFLICT");
+        String status = provisional ? "HOLD_AFTER_PROVISIONAL" : "HOLD_CONFLICT";
         inbox.updateState(event, status, "SOURCE_CONFLICT", null);
     }
 }

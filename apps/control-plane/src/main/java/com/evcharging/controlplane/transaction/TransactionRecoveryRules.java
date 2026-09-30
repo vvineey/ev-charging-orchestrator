@@ -54,7 +54,7 @@ class TransactionRecoveryRules {
         if (energy.scale() > 6 || energy.precision() - energy.scale() > 18) {
             return Outcome.hold("INVALID_OR_AMBIGUOUS_METER");
         }
-        return new Outcome("FINALIZED", null, evseId, first.occurredAt(), last.occurredAt(), energy);
+        return new Outcome("CALCULATED", null, evseId, first.occurredAt(), last.occurredAt(), energy);
     }
 
     private Integer evseId(JsonNode payload) {
