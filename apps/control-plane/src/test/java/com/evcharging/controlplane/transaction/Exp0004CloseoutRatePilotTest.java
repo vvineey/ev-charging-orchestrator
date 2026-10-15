@@ -33,6 +33,7 @@ import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.DriverManager;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -196,6 +197,31 @@ class Exp0004CloseoutRatePilotTest {
                     assertThat(count("exp0004_closeout", prefix)).isEqualTo(16);
                     assertThat(count("exp0004_outbox", prefix)).isEqualTo(16);
                     assertThat(pendingCount(prefix)).isZero();
+
+                    try (var consumerDatabase = EmbeddedPostgres.builder().start()) {
+                        String consumerJdbcUrl = consumerDatabase.getJdbcUrl("postgres", "postgres");
+                        try (var connection = DriverManager.getConnection(
+                                consumerJdbcUrl, "postgres", "postgres");
+                             var statement = connection.createStatement()) {
+                            statement.execute("""
+                                    CREATE TABLE exp0004_effect (
+                                        event_id UUID PRIMARY KEY,
+                                        transaction_id TEXT NOT NULL UNIQUE)
+                                    """);
+                        }
+                        String groupId = "exp0004-batch-fail-effect-" + run;
+                        assertThat(runConsumer("crash-after-db", outputTopic, consumerJdbcUrl,
+                                groupId, 1)).isEqualTo(137);
+                        assertThat(effectCount(consumerJdbcUrl)).isEqualTo(1);
+                        assertThat(runConsumer("normal", outputTopic, consumerJdbcUrl,
+                                groupId, 32)).isZero();
+                        assertThat(effectCount(consumerJdbcUrl)).isEqualTo(16);
+                        var offset = admin.listConsumerGroupOffsets(groupId)
+                                .partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS)
+                                .get(new TopicPartition(outputTopic, 0));
+                        assertThat(offset).isNotNull();
+                        assertThat(offset.offset()).isEqualTo(32);
+                    }
                 }
             } finally {
                 inbox.stop();
@@ -574,6 +600,36 @@ class Exp0004CloseoutRatePilotTest {
                 }
             }
             return ids;
+        }
+    }
+
+    private int runConsumer(String mode, String topic, String jdbcUrl, String groupId,
+                            int expectedRecords) throws Exception {
+        String classpath = System.getProperty("transaction.test.runtime-classpath");
+        assertThat(classpath).isNotBlank();
+        Path output = Path.of("build", "experiment-results", "exp0004-batch-consumer-" + mode + ".log");
+        Files.createDirectories(output.getParent());
+        var process = new ProcessBuilder(
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-cp", classpath, Exp0004IndependentConsumerProcess.class.getName(),
+                mode, broker.getBrokersAsString(), topic, jdbcUrl, groupId,
+                Integer.toString(expectedRecords))
+                .redirectErrorStream(true)
+                .redirectOutput(output.toFile())
+                .start();
+        if (!process.waitFor(45, TimeUnit.SECONDS)) {
+            process.destroyForcibly();
+            throw new IllegalStateException("independent consumer did not finish");
+        }
+        return process.exitValue();
+    }
+
+    private long effectCount(String jdbcUrl) throws Exception {
+        try (var connection = DriverManager.getConnection(jdbcUrl, "postgres", "postgres");
+             var statement = connection.createStatement();
+             var result = statement.executeQuery("SELECT count(*) FROM exp0004_effect")) {
+            result.next();
+            return result.getLong(1);
         }
     }
 
