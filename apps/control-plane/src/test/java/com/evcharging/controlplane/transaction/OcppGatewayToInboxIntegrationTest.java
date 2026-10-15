@@ -18,16 +18,19 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.test.EmbeddedKafkaBroker;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ObjectNode;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
@@ -36,6 +39,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyStore;
 import java.time.Duration;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
@@ -78,6 +83,7 @@ class OcppGatewayToInboxIntegrationTest {
     @Autowired EmbeddedKafkaBroker broker;
     @Autowired JdbcClient jdbc;
     @Autowired ObjectMapper mapper;
+    @Autowired KafkaListenerEndpointRegistry listenerRegistry;
     @TempDir Path directory;
 
     @Test
@@ -167,7 +173,7 @@ class OcppGatewayToInboxIntegrationTest {
     }
 
     @Test
-    void pinnedSapSimulatorTransactionReachesInboxAndStaysOnHold() throws Exception {
+    void pinnedSapSimulatorTransactionDistinguishesSameAndChangedSourceReplays() throws Exception {
         String simulatorDirectory = System.getenv("EVC_SAP_INBOX_SIMULATOR_DIR");
         Assumptions.assumeTrue(simulatorDirectory != null && Files.isDirectory(Path.of(simulatorDirectory)),
                 "Pinned SAP simulator is an optional, separately obtained E3 input");
@@ -256,7 +262,11 @@ class OcppGatewayToInboxIntegrationTest {
                     SELECT count(*) FROM transaction_session_candidate
                     WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
                     """).param("id", transactionId).query(Long.class).single()).isZero();
+            process.destroyForcibly();
+            process.waitFor(10, TimeUnit.SECONDS);
+            process = null;
             assertSameSourceReplayPreservesHold(transactionId);
+            assertChangedSourceReplayMovesToConflict(transactionId);
         } finally {
             if (process != null) {
                 process.destroyForcibly();
@@ -289,21 +299,7 @@ class OcppGatewayToInboxIntegrationTest {
                 SELECT updated_at::text FROM transaction_inbox_state
                 WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
                 """).param("id", transactionId).query(String.class).single();
-        String topic = "charging.transaction.observed.v1";
-        var partition = new TopicPartition(topic, 0);
-        try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()));
-             var producer = new KafkaProducer<String, String>(Map.of(
-                     ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString(),
-                     ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
-                     ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
-                     ProducerConfig.ACKS_CONFIG, "all"))) {
-            long replayOffset = producer.send(new ProducerRecord<>(topic, 0, "ST-E2E", source))
-                    .get(10, TimeUnit.SECONDS).offset();
-            await().atMost(Duration.ofSeconds(25)).untilAsserted(() -> assertThat(
-                    admin.listConsumerGroupOffsets(TransactionRecordListener.GROUP_ID)
-                            .partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS)
-                            .get(partition).offset()).isGreaterThan(replayOffset));
-        }
+        publishAndWaitForInboxOffset(source);
         assertThat(jdbc.sql("""
                 SELECT count(*) FROM transaction_inbox_event
                 WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
@@ -325,6 +321,135 @@ class OcppGatewayToInboxIntegrationTest {
                 SELECT updated_at::text FROM transaction_inbox_state
                 WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
                 """).param("id", transactionId).query(String.class).single()).isEqualTo(updatedAt);
+    }
+
+    private void assertChangedSourceReplayMovesToConflict(String transactionId) throws Exception {
+        String source = jdbc.sql("""
+                SELECT jsonb_build_object(
+                    'eventId', first_event_id,
+                    'eventType', 'OcppTransactionEventObserved',
+                    'schemaVersion', 1,
+                    'occurredAt', source_document->'occurredAt',
+                    'receivedAt', first_received_at,
+                    'stationId', source_document->'stationId',
+                    'chargingStationId', source_document->'chargingStationId',
+                    'payload', source_document->'payload')::text
+                FROM transaction_inbox_event
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                  AND event_type = 'Ended'
+                """).param("id", transactionId).query(String.class).single();
+        ObjectNode changed = (ObjectNode) mapper.readTree(source);
+        changed.put("eventId", UUID.randomUUID().toString());
+        changed.put("receivedAt", OffsetDateTime.now(ZoneOffset.UTC).toString());
+        int changedSamples = 0;
+        for (JsonNode meter : changed.path("payload").path("meterValue")) {
+            for (JsonNode sample : meter.path("sampledValue")) {
+                if ("Transaction.End".equals(sample.path("context").asText())
+                        && "Energy.Active.Import.Register".equals(sample.path("measurand").asText())) {
+                    ObjectNode value = (ObjectNode) sample;
+                    value.put("value", sample.path("value").decimalValue().add(BigDecimal.ONE));
+                    changedSamples++;
+                }
+            }
+        }
+        assertThat(changedSamples).isPositive();
+
+        long originalEventCount = jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_event
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single();
+        String changedRecord = mapper.writeValueAsString(changed);
+        var listener = listenerRegistry.getListenerContainer("transaction-inbox");
+        assertThat(listener).isNotNull();
+        listener.stop();
+        long committedBefore = inboxOffset();
+        long conflictOffset = publish(changedRecord);
+        try {
+            var builder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-cp", System.getProperty("transaction.test.runtime-classpath"),
+                    CrashAfterTransactionCommitProcess.class.getName(),
+                    "--spring.kafka.listener.auto-startup=false",
+                    "--transaction.ingress.enabled=true",
+                    "--transaction.kafka-topic=charging.transaction.observed.v1",
+                    "--transaction.test.group-id=" + TransactionRecordListener.GROUP_ID,
+                    "--spring.kafka.consumer.properties[session.timeout.ms]=6000",
+                    "--spring.kafka.consumer.properties[heartbeat.interval.ms]=1000");
+            builder.environment().put("SPRING_DATASOURCE_URL", POSTGRES.getJdbcUrl("postgres", "postgres"));
+            builder.environment().put("SPRING_DATASOURCE_USERNAME", "postgres");
+            builder.environment().put("SPRING_DATASOURCE_PASSWORD", "postgres");
+            builder.environment().put("SPRING_KAFKA_BOOTSTRAPSERVERS", broker.getBrokersAsString());
+            builder.redirectErrorStream(true).redirectOutput(directory.resolve("sap-conflict-crash-process.log").toFile());
+            Process child = builder.start();
+            try {
+                assertThat(child.waitFor(45, TimeUnit.SECONDS))
+                        .as("child JVM must commit the SAP-derived conflict and halt before offset commit").isTrue();
+                assertThat(child.exitValue()).isEqualTo(137);
+            } finally {
+                if (child.isAlive()) {
+                    child.destroyForcibly();
+                    child.waitFor(10, TimeUnit.SECONDS);
+                }
+            }
+            assertThat(inboxOffset()).isEqualTo(committedBefore);
+        } finally {
+            listener.start();
+        }
+        waitForInboxOffset(conflictOffset);
+        assertThat(jdbc.sql("""
+                SELECT status FROM transaction_inbox_state
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(String.class).single()).isEqualTo("HOLD_CONFLICT");
+        assertThat(jdbc.sql("""
+                SELECT hold_reason FROM transaction_inbox_state
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(String.class).single()).isEqualTo("SOURCE_CONFLICT");
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_event
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single()).isEqualTo(originalEventCount);
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_conflict
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single()).isEqualTo(1);
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM transaction_session_candidate
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single()).isZero();
+
+        publishAndWaitForInboxOffset(changedRecord);
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_conflict
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single()).isEqualTo(1);
+    }
+
+    private void publishAndWaitForInboxOffset(String record) throws Exception {
+        waitForInboxOffset(publish(record));
+    }
+
+    private long publish(String record) throws Exception {
+        String topic = "charging.transaction.observed.v1";
+        try (var producer = new KafkaProducer<String, String>(Map.of(
+                ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString(),
+                ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                ProducerConfig.ACKS_CONFIG, "all"))) {
+            return producer.send(new ProducerRecord<>(topic, 0, "ST-E2E", record))
+                    .get(10, TimeUnit.SECONDS).offset();
+        }
+    }
+
+    private long inboxOffset() throws Exception {
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()))) {
+            return admin.listConsumerGroupOffsets(TransactionRecordListener.GROUP_ID)
+                    .partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS)
+                    .get(new TopicPartition("charging.transaction.observed.v1", 0)).offset();
+        }
+    }
+
+    private void waitForInboxOffset(long recordOffset) {
+        await().atMost(Duration.ofSeconds(25)).untilAsserted(() ->
+                assertThat(inboxOffset()).isGreaterThan(recordOffset));
     }
 
     private ConfigurableApplicationContext startGateway(LocalTls tls, String chargingStationId) {
