@@ -34,4 +34,8 @@ tasks.test {
     systemProperty("transaction.test.runtime-classpath", sourceSets.test.get().runtimeClasspath.asPath)
     systemProperty("transaction.test.comparison-output",
             layout.buildDirectory.file("experiment-results/exp-0002-candidate-correctness.json").get().asFile.absolutePath)
+    systemProperty("transaction.test.performance-output",
+            layout.buildDirectory.file("experiment-results/exp-0002-online-performance.json").get().asFile.absolutePath)
+    systemProperty("transaction.test.performance-enabled", project.findProperty("performanceEnabled")?.toString() ?: "false")
+    systemProperty("transaction.test.window-seconds", project.findProperty("performanceWindowSeconds")?.toString() ?: "300")
 }
