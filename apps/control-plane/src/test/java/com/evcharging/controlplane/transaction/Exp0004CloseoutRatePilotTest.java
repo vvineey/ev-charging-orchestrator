@@ -33,6 +33,7 @@ import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.DriverManager;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -52,6 +53,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -98,6 +100,10 @@ class Exp0004CloseoutRatePilotTest {
     @Test
     void measuresOcppDerivedCloseoutCommitToKafkaObservation() throws Exception {
         assumeTrue("true".equalsIgnoreCase(System.getenv("EVC_EXP0004_RATE_PILOT")));
+        String relayMode = System.getenv().getOrDefault("EVC_EXP0004_RELAY_MODE", "SEQUENTIAL");
+        if (!relayMode.equals("SEQUENTIAL") && !relayMode.equals("BATCH_ACK")) {
+            throw new IllegalArgumentException("Unsupported relay mode: " + relayMode);
+        }
         String run = UUID.randomUUID().toString();
         String prefix = "TX-RATE-" + run + "-";
         String inputTopic = "exp0004-rate-input-" + run;
@@ -125,7 +131,98 @@ class Exp0004CloseoutRatePilotTest {
                     assertThat(candidateCount(prefix)).isEqualTo(EXPECTED);
                     assertThat(validCandidateCount(prefix)).isEqualTo(EXPECTED);
                 });
-                runRatePilot(run, prefix, outputTopic, brokers, output);
+                runRatePilot(run, prefix, outputTopic, brokers, output, relayMode);
+            } finally {
+                inbox.stop();
+            }
+        }
+    }
+
+    @Test
+    void batchAckFailureBeforeMarkReplaysWithTheSameEventIds() throws Exception {
+        assumeTrue("true".equalsIgnoreCase(System.getenv("EVC_EXP0004_BATCH_FAILURE_TEST")));
+        String run = UUID.randomUUID().toString();
+        String prefix = "TX-BATCH-FAIL-" + run + "-";
+        String inputTopic = "exp0004-batch-fail-input-" + run;
+        String outputTopic = "exp0004-batch-fail-output-" + run;
+        String brokers = broker.getBrokersAsString();
+        createTables();
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", brokers));
+             var input = producer(brokers);
+             var output = producer(brokers)) {
+            admin.createTopics(List.of(new NewTopic(inputTopic, 1, (short) 1),
+                    new NewTopic(outputTopic, 1, (short) 1))).all().get(10, TimeUnit.SECONDS);
+            var inbox = factory.createContainer(inputTopic);
+            inbox.getContainerProperties().setGroupId("exp0004-batch-fail-inbox-" + run);
+            inbox.getContainerProperties().setPollTimeout(100);
+            inbox.getContainerProperties().setMessageListener(
+                    (MessageListener<String, String>) listener::consume);
+            inbox.start();
+            try {
+                for (int i = 0; i < 16; i++) {
+                    send(input, inputTopic, prefix + i, 0, "Started", 10000);
+                    send(input, inputTopic, prefix + i, 1, "Ended", 12500);
+                }
+                await().atMost(Duration.ofSeconds(25)).untilAsserted(() ->
+                        assertThat(validCandidateCount(prefix)).isEqualTo(16));
+                var config = new HikariConfig();
+                config.setJdbcUrl(POSTGRES.getJdbcUrl("postgres", "postgres"));
+                config.setUsername("postgres");
+                config.setPassword("postgres");
+                config.setMaximumPoolSize(16);
+                try (var pool = new HikariDataSource(config)) {
+                    for (int i = 0; i < 16; i++) commitCloseout(pool, prefix + i);
+                    var acked = new ConcurrentHashMap<UUID, Long>();
+                    var marked = new ConcurrentHashMap<UUID, Long>();
+                    var ackDurations = Collections.synchronizedList(new ArrayList<Double>());
+                    var markDurations = Collections.synchronizedList(new ArrayList<Double>());
+                    assertThatThrownBy(() -> pollBatch(pool, output, outputTopic, prefix,
+                            "BATCH_ACK", true, acked, marked, ackDurations, markDurations))
+                            .isInstanceOf(IllegalStateException.class)
+                            .hasMessage("ACKED_BEFORE_MARK");
+                    assertThat(acked).hasSize(16);
+                    assertThat(marked).isEmpty();
+                    assertThat(pendingCount(prefix)).isEqualTo(16);
+                    var first = readOutputEventIds(outputTopic, 16);
+                    assertThat(first).hasSize(16);
+                    assertThat(first.stream().distinct().count()).isEqualTo(16);
+
+                    assertThat(pollBatch(pool, output, outputTopic, prefix,
+                            "BATCH_ACK", false, acked, marked, ackDurations, markDurations))
+                            .isEqualTo(16);
+                    var replayed = readOutputEventIds(outputTopic, 32);
+                    assertThat(replayed).hasSize(32);
+                    assertThat(replayed.subList(16, 32)).containsExactlyInAnyOrderElementsOf(first);
+                    assertThat(replayed.stream().distinct().count()).isEqualTo(16);
+                    assertThat(count("exp0004_closeout", prefix)).isEqualTo(16);
+                    assertThat(count("exp0004_outbox", prefix)).isEqualTo(16);
+                    assertThat(pendingCount(prefix)).isZero();
+
+                    try (var consumerDatabase = EmbeddedPostgres.builder().start()) {
+                        String consumerJdbcUrl = consumerDatabase.getJdbcUrl("postgres", "postgres");
+                        try (var connection = DriverManager.getConnection(
+                                consumerJdbcUrl, "postgres", "postgres");
+                             var statement = connection.createStatement()) {
+                            statement.execute("""
+                                    CREATE TABLE exp0004_effect (
+                                        event_id UUID PRIMARY KEY,
+                                        transaction_id TEXT NOT NULL UNIQUE)
+                                    """);
+                        }
+                        String groupId = "exp0004-batch-fail-effect-" + run;
+                        assertThat(runConsumer("crash-after-db", outputTopic, consumerJdbcUrl,
+                                groupId, 1)).isEqualTo(137);
+                        assertThat(effectCount(consumerJdbcUrl)).isEqualTo(1);
+                        assertThat(runConsumer("normal", outputTopic, consumerJdbcUrl,
+                                groupId, 32)).isZero();
+                        assertThat(effectCount(consumerJdbcUrl)).isEqualTo(16);
+                        var offset = admin.listConsumerGroupOffsets(groupId)
+                                .partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS)
+                                .get(new TopicPartition(outputTopic, 0));
+                        assertThat(offset).isNotNull();
+                        assertThat(offset.offset()).isEqualTo(32);
+                    }
+                }
             } finally {
                 inbox.stop();
             }
@@ -133,7 +230,7 @@ class Exp0004CloseoutRatePilotTest {
     }
 
     private void runRatePilot(String run, String prefix, String topic, String brokers,
-                              KafkaProducer<String, String> producer) throws Exception {
+                              KafkaProducer<String, String> producer, String relayMode) throws Exception {
         var config = new HikariConfig();
         config.setJdbcUrl(POSTGRES.getJdbcUrl("postgres", "postgres"));
         config.setUsername("postgres");
@@ -203,7 +300,7 @@ class Exp0004CloseoutRatePilotTest {
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SECONDS + 60L);
                 startSignal.await();
                 while (published < EXPECTED && System.nanoTime() < deadline) {
-                    int count = pollBatch(pool, producer, topic, prefix,
+                    int count = pollBatch(pool, producer, topic, prefix, relayMode, false,
                             ackedAt, markedAt, sendAckDurations, markDurations);
                     published += count;
                     if (count == 0) LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(5));
@@ -278,13 +375,12 @@ class Exp0004CloseoutRatePilotTest {
             Collections.sort(markDurations);
             long closeouts = count("exp0004_closeout", prefix);
             long outbox = count("exp0004_outbox", prefix);
-            long pending = jdbc.sql("""
-                    SELECT count(*) FROM exp0004_outbox
-                    WHERE transaction_id LIKE :prefix AND published_at IS NULL
-                    """).param("prefix", prefix + "%").query(Long.class).single();
+            long pending = pendingCount(prefix);
             var result = mapper.createObjectNode();
             result.put("issue", 60);
             result.put("mode", "OCPP-derived test closeout + single batch-16 Polling Relay");
+            result.put("comparisonIssue", 62);
+            result.put("relayMode", relayMode);
             result.put("ratePerSecond", RATE);
             result.put("seconds", SECONDS);
             result.put("planned", EXPECTED);
@@ -321,7 +417,8 @@ class Exp0004CloseoutRatePilotTest {
             result.put("poolConnectionsMax", 16);
             result.put("relayBatch", 16);
             result.set("samples", mapper.valueToTree(samples));
-            Path output = Path.of("build", "experiment-results", "exp-0004-rate-pilot.json");
+            Path output = Path.of("build", "experiment-results",
+                    "exp-0004-rate-pilot-" + relayMode.toLowerCase() + ".json");
             Files.createDirectories(output.getParent());
             Files.writeString(output, mapper.writerWithDefaultPrettyPrinter().writeValueAsString(result));
             result.remove("samples");
@@ -371,7 +468,7 @@ class Exp0004CloseoutRatePilotTest {
     }
 
     private int pollBatch(HikariDataSource pool, KafkaProducer<String, String> producer,
-                          String topic, String prefix,
+                          String topic, String prefix, String relayMode, boolean failAfterBatchAck,
                           ConcurrentHashMap<UUID, Long> ackedAt,
                           ConcurrentHashMap<UUID, Long> markedAt,
                           List<Double> sendAckDurations, List<Double> markDurations) throws Exception {
@@ -389,27 +486,53 @@ class Exp0004CloseoutRatePilotTest {
                         result.getString("station_id"), result.getString("payload")));
             }
         }
-        for (var row : rows) {
-            long sendStartedNs = System.nanoTime();
-            producer.send(new ProducerRecord<>(topic, row.stationId(), row.payload()))
-                    .get(10, TimeUnit.SECONDS);
-            long ackNs = System.nanoTime();
-            ackedAt.put(row.eventId(), ackNs);
-            sendAckDurations.add((ackNs - sendStartedNs) / 1_000_000.0);
-            long markStartedNs = System.nanoTime();
-            try (var connection = pool.getConnection();
-                 var statement = connection.prepareStatement("""
-                         UPDATE exp0004_outbox SET published_at = now()
-                         WHERE event_id = ? AND published_at IS NULL
-                         """)) {
-                statement.setObject(1, row.eventId());
-                assertThat(statement.executeUpdate()).isEqualTo(1);
+        if (relayMode.equals("BATCH_ACK")) {
+            var sends = new ArrayList<Future<?>>(rows.size());
+            for (var row : rows) {
+                sends.add(sendAndMeasure(producer, topic, row, ackedAt, sendAckDurations));
             }
-            long markedNs = System.nanoTime();
-            markedAt.put(row.eventId(), markedNs);
-            markDurations.add((markedNs - markStartedNs) / 1_000_000.0);
+            for (var send : sends) send.get(10, TimeUnit.SECONDS);
+            if (failAfterBatchAck) throw new IllegalStateException("ACKED_BEFORE_MARK");
+            for (var row : rows) markPublished(pool, row, markedAt, markDurations);
+        } else {
+            for (var row : rows) {
+                sendAndMeasure(producer, topic, row, ackedAt, sendAckDurations)
+                        .get(10, TimeUnit.SECONDS);
+                markPublished(pool, row, markedAt, markDurations);
+            }
         }
         return rows.size();
+    }
+
+    private Future<?> sendAndMeasure(KafkaProducer<String, String> producer, String topic,
+                                     OutboxRow row, ConcurrentHashMap<UUID, Long> ackedAt,
+                                     List<Double> sendAckDurations) {
+        long sendStartedNs = System.nanoTime();
+        return producer.send(new ProducerRecord<>(topic, row.stationId(), row.payload()),
+                (metadata, failure) -> {
+                    if (failure == null) {
+                        long ackNs = System.nanoTime();
+                        ackedAt.put(row.eventId(), ackNs);
+                        sendAckDurations.add((ackNs - sendStartedNs) / 1_000_000.0);
+                    }
+                });
+    }
+
+    private void markPublished(HikariDataSource pool, OutboxRow row,
+                               ConcurrentHashMap<UUID, Long> markedAt,
+                               List<Double> markDurations) throws Exception {
+        long markStartedNs = System.nanoTime();
+        try (var connection = pool.getConnection();
+             var statement = connection.prepareStatement("""
+                     UPDATE exp0004_outbox SET published_at = now()
+                     WHERE event_id = ? AND published_at IS NULL
+                     """)) {
+            statement.setObject(1, row.eventId());
+            assertThat(statement.executeUpdate()).isEqualTo(1);
+        }
+        long markedNs = System.nanoTime();
+        markedAt.put(row.eventId(), markedNs);
+        markDurations.add((markedNs - markStartedNs) / 1_000_000.0);
     }
 
     private record OutboxRow(UUID eventId, String stationId, String payload) {}
@@ -450,6 +573,64 @@ class Exp0004CloseoutRatePilotTest {
     private long count(String table, String prefix) {
         return jdbc.sql("SELECT count(*) FROM " + table + " WHERE transaction_id LIKE :prefix")
                 .param("prefix", prefix + "%").query(Long.class).single();
+    }
+
+    private long pendingCount(String prefix) {
+        return jdbc.sql("""
+                SELECT count(*) FROM exp0004_outbox
+                WHERE transaction_id LIKE :prefix AND published_at IS NULL
+                """).param("prefix", prefix + "%").query(Long.class).single();
+    }
+
+    private List<UUID> readOutputEventIds(String topic, int expected) throws Exception {
+        var partition = new TopicPartition(topic, 0);
+        try (var consumer = new KafkaConsumer<String, String>(Map.of(
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString(),
+                ConsumerConfig.GROUP_ID_CONFIG, "exp0004-batch-fail-reader-" + UUID.randomUUID(),
+                ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false"))) {
+            consumer.assign(List.of(partition));
+            consumer.seekToBeginning(List.of(partition));
+            var ids = new ArrayList<UUID>();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (ids.size() < expected && System.nanoTime() < deadline) {
+                for (var record : consumer.poll(Duration.ofMillis(100))) {
+                    ids.add(UUID.fromString(mapper.readTree(record.value()).path("eventId").asText()));
+                }
+            }
+            return ids;
+        }
+    }
+
+    private int runConsumer(String mode, String topic, String jdbcUrl, String groupId,
+                            int expectedRecords) throws Exception {
+        String classpath = System.getProperty("transaction.test.runtime-classpath");
+        assertThat(classpath).isNotBlank();
+        Path output = Path.of("build", "experiment-results", "exp0004-batch-consumer-" + mode + ".log");
+        Files.createDirectories(output.getParent());
+        var process = new ProcessBuilder(
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-cp", classpath, Exp0004IndependentConsumerProcess.class.getName(),
+                mode, broker.getBrokersAsString(), topic, jdbcUrl, groupId,
+                Integer.toString(expectedRecords))
+                .redirectErrorStream(true)
+                .redirectOutput(output.toFile())
+                .start();
+        if (!process.waitFor(45, TimeUnit.SECONDS)) {
+            process.destroyForcibly();
+            throw new IllegalStateException("independent consumer did not finish");
+        }
+        return process.exitValue();
+    }
+
+    private long effectCount(String jdbcUrl) throws Exception {
+        try (var connection = DriverManager.getConnection(jdbcUrl, "postgres", "postgres");
+             var statement = connection.createStatement();
+             var result = statement.executeQuery("SELECT count(*) FROM exp0004_effect")) {
+            result.next();
+            return result.getLong(1);
+        }
     }
 
     private static double percentile(List<Double> sorted, double percentile) {
