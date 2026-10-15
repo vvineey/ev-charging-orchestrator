@@ -15,6 +15,7 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
@@ -62,7 +63,11 @@ class Exp0003OutboxSteadyTest {
         String mode = System.getProperty("exp0003.steady.mode");
         int rate = Integer.parseInt(System.getProperty("exp0003.steady.rate"));
         int seconds = Integer.parseInt(System.getProperty("exp0003.steady.seconds"));
+        String cdcPollMs = System.getProperty("exp0003.steady.cdc-poll-ms", "default");
         if (!mode.equals("POLLING") && !mode.equals("CDC")) throw new IllegalArgumentException(mode);
+        if (!cdcPollMs.equals("default") && !cdcPollMs.equals("500") && !cdcPollMs.equals("50")) {
+            throw new IllegalArgumentException("Unsupported CDC poll interval: " + cdcPollMs);
+        }
         if (rate < 1 || seconds < 1 || (long) rate * seconds > 100_000) {
             throw new IllegalArgumentException("Rate and seconds must produce 1..100000 events");
         }
@@ -82,8 +87,9 @@ class Exp0003OutboxSteadyTest {
         }
         if (mode.equals("CDC")) {
             waitForRestReady();
-            registerConnector();
+            registerConnector(cdcPollMs);
             waitForConnector();
+            verifyConnectorPollInterval(cdcPollMs);
             waitForSlot(dataSource);
         } else {
             compose("stop", "connect");
@@ -268,6 +274,7 @@ class Exp0003OutboxSteadyTest {
 
             var result = new LinkedHashMap<String, Object>();
             result.put("mode", mode);
+            result.put("cdcPollIntervalMs", mode.equals("CDC") ? cdcPollMs : null);
             result.put("inputStartedAtEpochMillis", inputStartedAtEpochMillis);
             result.put("inputPlannedEndAtEpochMillis", inputStartedAtEpochMillis + seconds * 1_000L);
             result.put("targetRatePerSecond", rate);
@@ -337,14 +344,31 @@ class Exp0003OutboxSteadyTest {
         }
     }
 
-    private void registerConnector() throws Exception {
-        String body = Files.readString(Path.of(System.getProperty("exp0003.cdc.connector-file")));
+    private void registerConnector(String cdcPollMs) throws Exception {
+        var request = (ObjectNode) mapper.readTree(
+                Files.readString(Path.of(System.getProperty("exp0003.cdc.connector-file"))));
+        if (!cdcPollMs.equals("default")) {
+            ((ObjectNode) request.path("config")).put("poll.interval.ms", cdcPollMs);
+        }
+        String body = mapper.writeValueAsString(request);
         var response = http.send(HttpRequest.newBuilder(URI.create(CONNECT + "/connectors"))
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(body)).build(),
                 HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() != 201) throw new IllegalStateException(
                 "Connector registration HTTP " + response.statusCode() + ": " + response.body());
+    }
+
+    private void verifyConnectorPollInterval(String cdcPollMs) throws Exception {
+        if (cdcPollMs.equals("default")) return;
+        var response = http.send(HttpRequest.newBuilder(
+                        URI.create(CONNECT + "/connectors/exp0003-outbox-cdc/config"))
+                        .timeout(Duration.ofSeconds(3)).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(mapper.readTree(response.body()).path("poll.interval.ms").asText())
+                .as("Applied Connect poll.interval.ms")
+                .isEqualTo(cdcPollMs);
     }
 
     private void waitForRestReady() throws Exception {

@@ -6,6 +6,7 @@ mode="${1:?Use POLLING or CDC}"
 rate="${2:?Provide target events per second}"
 seconds="${3:?Provide input duration in seconds}"
 run_id="${4:?Provide a lowercase run ID}"
+cdc_poll_ms="${5:-default}"
 if [[ "$mode" != "POLLING" && "$mode" != "CDC" ]]; then
   echo "mode must be POLLING or CDC" >&2
   exit 2
@@ -16,6 +17,14 @@ if [[ ! "$rate" =~ ^[0-9]+$ || "$rate" -lt 1 || ! "$seconds" =~ ^[0-9]+$ || "$se
 fi
 if [[ ! "$run_id" =~ ^[a-z0-9-]+$ ]]; then
   echo "run ID must contain only lowercase letters, digits, and hyphens" >&2
+  exit 2
+fi
+if [[ "$cdc_poll_ms" != "default" && "$cdc_poll_ms" != "500" && "$cdc_poll_ms" != "50" ]]; then
+  echo "CDC poll interval must be default, 500, or 50 ms" >&2
+  exit 2
+fi
+if [[ "$mode" != "CDC" && "$cdc_poll_ms" != "default" ]]; then
+  echo "CDC poll interval applies only to CDC mode" >&2
   exit 2
 fi
 if [[ -z "${JAVA_HOME:-}" ]]; then
@@ -60,6 +69,7 @@ cd "$repo_root"
   -Pexp0003SteadyMode="$mode" \
   -Pexp0003SteadyRate="$rate" \
   -Pexp0003SteadySeconds="$seconds" \
+  -Pexp0003SteadyCdcPollMs="$cdc_poll_ms" \
   -Pexp0003SteadyOutput="$result_file" \
   --no-daemon --console=plain
 stop_sampler
