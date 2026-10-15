@@ -241,11 +241,11 @@ class Exp0003OutboxSoakTest {
                     }
                 }
                 writers.shutdown();
-                assertThat(writers.awaitTermination(300, TimeUnit.SECONDS)).isTrue();
                 while (System.nanoTime() < plannedEndNs && fatal.get() == null) {
                     LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
                 }
                 int committedAtPlannedEnd = committed.get();
+                assertThat(writers.awaitTermination(300, TimeUnit.SECONDS)).isTrue();
                 if (fatal.get() != null) throw new IllegalStateException("Soak run failed", fatal.get());
                 assertThat(submitted).isEqualTo(expected);
                 assertThat(committedAtPlannedEnd).isGreaterThanOrEqualTo((int) Math.ceil(expected * 0.95));
@@ -330,19 +330,29 @@ class Exp0003OutboxSoakTest {
             AtomicInteger observedPhysical, AtomicInteger appliedEffects, AtomicInteger maxBacklog,
             ConcurrentHashMap<Integer, Timing> pending, Histogram lifetime, Histogram minute,
             Histogram commitService, Histogram scheduleSlip, AtomicReference<Throwable> fatal) throws Exception {
+        long sampledAtEpochMillis = System.currentTimeMillis();
         double elapsedSeconds = (System.nanoTime() - startNs) / 1_000_000_000.0;
+        int committedSnapshot = committed.get();
+        int observedSnapshot = observedUnique.get();
+        int physicalSnapshot = observedPhysical.get();
+        int effectsSnapshot = appliedEffects.get();
+        int maxBacklogSnapshot = maxBacklog.get();
+        int pendingSnapshot = pending.size();
+        double processCpuSeconds = os.getProcessCpuTime() / 1_000_000_000.0;
+        long heapUsedBytes = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
         long dockerFreeBytes = dockerFreeBytes();
         var checkpoint = new LinkedHashMap<String, Object>();
+        checkpoint.put("sampledAtEpochMillis", sampledAtEpochMillis);
         checkpoint.put("elapsedSeconds", elapsedSeconds);
         checkpoint.put("expectedCommittedByNow", Math.min((long) rate * seconds,
                 (long) Math.floor(elapsedSeconds * rate)));
-        checkpoint.put("committed", committed.get());
-        checkpoint.put("observedUnique", observedUnique.get());
-        checkpoint.put("observedPhysical", observedPhysical.get());
-        checkpoint.put("appliedEffects", appliedEffects.get());
-        checkpoint.put("observedBacklog", Math.max(0, committed.get() - observedUnique.get()));
-        checkpoint.put("maxObservedBacklog", maxBacklog.get());
-        checkpoint.put("pendingTimings", pending.size());
+        checkpoint.put("committed", committedSnapshot);
+        checkpoint.put("observedUnique", observedSnapshot);
+        checkpoint.put("observedPhysical", physicalSnapshot);
+        checkpoint.put("appliedEffects", effectsSnapshot);
+        checkpoint.put("observedBacklog", Math.max(0, committedSnapshot - observedSnapshot));
+        checkpoint.put("maxObservedBacklog", maxBacklogSnapshot);
+        checkpoint.put("pendingTimings", pendingSnapshot);
         checkpoint.put("minuteLatencyCount", minute.count());
         checkpoint.put("minuteCommitToKafkaP95Ms", minute.percentile(0.95));
         checkpoint.put("cumulativeCommitToKafkaP50Ms", lifetime.percentile(0.50));
@@ -350,8 +360,8 @@ class Exp0003OutboxSoakTest {
         checkpoint.put("cumulativeCommitToKafkaP99Ms", lifetime.percentile(0.99));
         checkpoint.put("scheduleSlipP95Ms", scheduleSlip.percentile(0.95));
         checkpoint.put("commitServiceP95Ms", commitService.percentile(0.95));
-        checkpoint.put("testJvmProcessCpuSeconds", os.getProcessCpuTime() / 1_000_000_000.0);
-        checkpoint.put("testJvmHeapUsedBytes", Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory());
+        checkpoint.put("testJvmProcessCpuSeconds", processCpuSeconds);
+        checkpoint.put("testJvmHeapUsedBytes", heapUsedBytes);
         checkpoint.put("cdcRetainedWalBytes", retainedWalBytes(dataSource));
         checkpoint.put("databaseSizeBytes", databaseSizeBytes(dataSource));
         checkpoint.put("dockerFreeBytes", dockerFreeBytes);
@@ -361,10 +371,10 @@ class Exp0003OutboxSoakTest {
             fatal.compareAndSet(null, new IllegalStateException("Docker free disk below 10 GiB"));
         }
         if (elapsedSeconds >= 300 && elapsedSeconds < 360
-                && committed.get() < (long) rate * 300 * 0.90) {
+                && committedSnapshot < (long) rate * 300 * 0.90) {
             fatal.compareAndSet(null, new IllegalStateException("First five-minute input below 90% target"));
         }
-        if (pending.size() > MAX_PENDING) {
+        if (pendingSnapshot > MAX_PENDING) {
             fatal.compareAndSet(null, new IllegalStateException("Pending timings exceeded " + MAX_PENDING));
         }
     }
