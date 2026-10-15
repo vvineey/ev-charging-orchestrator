@@ -34,4 +34,11 @@ tasks.test {
     systemProperty("transaction.test.runtime-classpath", sourceSets.test.get().runtimeClasspath.asPath)
     systemProperty("transaction.test.comparison-output",
             layout.buildDirectory.file("experiment-results/exp-0002-candidate-correctness.json").get().asFile.absolutePath)
+    systemProperty("transaction.test.peak-enabled", providers.gradleProperty("peakEnabled").orElse("false").get())
+    systemProperty("transaction.test.peak-rate", providers.gradleProperty("peakRate").orElse("100").get())
+    systemProperty("transaction.test.peak-seconds", providers.gradleProperty("peakSeconds").orElse("20").get())
+    systemProperty("transaction.test.peak-partitions", providers.gradleProperty("peakPartitions").orElse("1").get())
+    systemProperty("transaction.test.peak-ack-mode", providers.gradleProperty("peakAckMode").orElse("RECORD").get())
+    systemProperty("transaction.test.peak-output",
+            layout.buildDirectory.file("experiment-results/current-inbox-peak-baseline.json").get().asFile.absolutePath)
 }

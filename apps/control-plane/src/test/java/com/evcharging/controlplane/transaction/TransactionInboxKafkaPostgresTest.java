@@ -23,6 +23,7 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 import org.springframework.kafka.listener.MessageListener;
+import org.springframework.kafka.listener.ContainerProperties;
 import org.springframework.kafka.test.EmbeddedKafkaBroker;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import tools.jackson.databind.ObjectMapper;
@@ -243,6 +244,39 @@ class TransactionInboxKafkaPostgresTest {
     }
 
     @Test
+    void batchOffsetCommitGapReplaysCommittedRecordsWithoutDuplicatingCandidate() throws Exception {
+        String transactionId = "TX-BATCH-COMMIT-GAP";
+        String groupId = "transaction-test-" + UUID.randomUUID();
+        send(transactionId, 0, "Started", 10000, true, false);
+        send(transactionId, 1, "Updated", 11500, false, false);
+        send(transactionId, 2, "Ended", 12500, false, false);
+        AtomicBoolean injected = new AtomicBoolean();
+        start(groupId, record -> {
+            listener.consume(record);
+            if (record.offset() == 2 && injected.compareAndSet(false, true)) {
+                throw new IllegalStateException("injected_after_database_commit_before_batch_offset_commit");
+            }
+        }, ContainerProperties.AckMode.BATCH);
+        awaitState(transactionId, "PROVISIONAL");
+        await().atMost(Duration.ofSeconds(25)).untilAsserted(() -> {
+            assertThat(injected.get()).isTrue();
+            assertThat(container.isRunning()).isFalse();
+            assertThat(offset()).isLessThan(3);
+        });
+        assertThat(eventCount(transactionId)).isEqualTo(3);
+        assertThat(sessionCount(transactionId)).isEqualTo(1);
+
+        container.stop();
+        container = null;
+        start(groupId, listener::consume, ContainerProperties.AckMode.BATCH);
+        waitForOffset(3);
+        assertThat(eventCount(transactionId)).isEqualTo(3);
+        assertThat(sessionCount(transactionId)).isEqualTo(1);
+        assertThat(energy(transactionId)).isEqualByComparingTo("2500");
+        assertThat(candidateStatus(transactionId)).isEqualTo("PROVISIONAL");
+    }
+
+    @Test
     void actualJvmHaltAfterDbCommitReplaysWithoutDuplicatingSession() throws Exception {
         String transactionId = "TX-JVM-HALT";
         String groupId = "transaction-test-" + UUID.randomUUID();
@@ -291,15 +325,69 @@ class TransactionInboxKafkaPostgresTest {
         assertThat(candidateStatus(transactionId)).isEqualTo("PROVISIONAL");
     }
 
+    @Test
+    void actualJvmHaltBeforeBatchOffsetCommitReplaysWithoutDuplicatingCandidate() throws Exception {
+        String transactionId = "TX-BATCH-JVM-HALT";
+        String groupId = "transaction-test-" + UUID.randomUUID();
+        send(transactionId, 0, "Started", 10000, true, false);
+        send(transactionId, 1, "Updated", 11500, false, false);
+        send(transactionId, 2, "Ended", 12500, false, false);
+        var builder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-cp", System.getProperty("transaction.test.runtime-classpath"),
+                CrashAfterTransactionCommitProcess.class.getName(),
+                "--spring.kafka.listener.auto-startup=false",
+                "--transaction.ingress.enabled=true",
+                "--transaction.recovery.experimental-candidate-calculation-enabled=true",
+                "--transaction.kafka-topic=" + topic,
+                "--transaction.test.group-id=" + groupId,
+                "--transaction.test.ack-mode=BATCH",
+                "--transaction.test.halt-offset=2",
+                "--spring.kafka.consumer.properties[session.timeout.ms]=6000",
+                "--spring.kafka.consumer.properties[heartbeat.interval.ms]=1000");
+        builder.environment().put("SPRING_DATASOURCE_URL", POSTGRES.getJdbcUrl("postgres", "postgres"));
+        builder.environment().put("SPRING_DATASOURCE_USERNAME", "postgres");
+        builder.environment().put("SPRING_DATASOURCE_PASSWORD", "postgres");
+        builder.environment().put("SPRING_KAFKA_BOOTSTRAPSERVERS", broker.getBrokersAsString());
+        builder.redirectErrorStream(true).redirectOutput(directory.resolve("transaction-batch-crash-process.log").toFile());
+        Process process = builder.start();
+        try {
+            assertThat(process.waitFor(45, TimeUnit.SECONDS)).isTrue();
+            assertThat(process.exitValue()).isEqualTo(137);
+        } finally {
+            if (process.isAlive()) {
+                process.destroyForcibly();
+                process.waitFor(10, TimeUnit.SECONDS);
+            }
+        }
+        awaitState(transactionId, "PROVISIONAL");
+        activeGroupId = groupId;
+        assertThat(offset()).isLessThan(3);
+        assertThat(eventCount(transactionId)).isEqualTo(3);
+        assertThat(sessionCount(transactionId)).isEqualTo(1);
+
+        start(groupId, listener::consume, ContainerProperties.AckMode.BATCH);
+        waitForOffset(3);
+        assertThat(eventCount(transactionId)).isEqualTo(3);
+        assertThat(sessionCount(transactionId)).isEqualTo(1);
+        assertThat(energy(transactionId)).isEqualByComparingTo("2500");
+        assertThat(candidateStatus(transactionId)).isEqualTo("PROVISIONAL");
+    }
+
     private void start() {
         start("transaction-test-" + UUID.randomUUID(), listener::consume);
     }
 
     private void start(String groupId, MessageListener<String, String> messageListener) {
+        start(groupId, messageListener, ContainerProperties.AckMode.RECORD);
+    }
+
+    private void start(String groupId, MessageListener<String, String> messageListener,
+                       ContainerProperties.AckMode ackMode) {
         container = factory.createContainer(topic);
         activeGroupId = groupId;
         container.getContainerProperties().setGroupId(activeGroupId);
         container.getContainerProperties().setPollTimeout(100);
+        container.getContainerProperties().setAckMode(ackMode);
         container.getContainerProperties().setMessageListener(messageListener);
         container.start();
     }

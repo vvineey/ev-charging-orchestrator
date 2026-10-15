@@ -5,6 +5,7 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.listener.MessageListener;
+import org.springframework.kafka.listener.ContainerProperties;
 
 import java.util.concurrent.CountDownLatch;
 
@@ -22,9 +23,12 @@ public final class CrashAfterTransactionCommitProcess {
         container.getContainerProperties().setGroupId(
                 context.getEnvironment().getRequiredProperty("transaction.test.group-id"));
         container.getContainerProperties().setPollTimeout(100);
+        container.getContainerProperties().setAckMode(ContainerProperties.AckMode.valueOf(
+                context.getEnvironment().getProperty("transaction.test.ack-mode", "RECORD")));
+        long haltOffset = context.getEnvironment().getProperty("transaction.test.halt-offset", Long.class, -1L);
         container.getContainerProperties().setMessageListener((MessageListener<String, String>) record -> {
             listener.consume(record);
-            Runtime.getRuntime().halt(137);
+            if (haltOffset < 0 || record.offset() == haltOffset) Runtime.getRuntime().halt(137);
         });
         container.start();
         new CountDownLatch(1).await();
