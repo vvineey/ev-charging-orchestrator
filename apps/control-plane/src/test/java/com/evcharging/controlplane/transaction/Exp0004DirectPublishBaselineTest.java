@@ -211,6 +211,115 @@ class Exp0004DirectPublishBaselineTest {
         }
     }
 
+    @Test
+    void testOutboxPollingRecoversWriterCrashAndExposesAckWindowDuplicate() throws Exception {
+        String inputTopic = "exp0004-outbox-input-" + UUID.randomUUID();
+        String outputTopic = "exp0004-outbox-closeout-" + UUID.randomUUID();
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()));
+             var input = new KafkaProducer<String, String>(Map.of(
+                     ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString(),
+                     ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.ACKS_CONFIG, "all"))) {
+            admin.createTopics(List.of(new NewTopic(inputTopic, 1, (short) 1),
+                    new NewTopic(outputTopic, 1, (short) 1))).all().get(10, TimeUnit.SECONDS);
+            jdbc.sql("""
+                    CREATE TABLE IF NOT EXISTS exp0004_closeout (
+                        charging_station_id TEXT NOT NULL,
+                        transaction_id TEXT NOT NULL,
+                        station_id TEXT NOT NULL,
+                        energy_wh NUMERIC(24,6) NOT NULL,
+                        event_id UUID NOT NULL UNIQUE,
+                        PRIMARY KEY (charging_station_id, transaction_id)
+                    )
+                    """).update();
+            jdbc.sql("""
+                    CREATE TABLE IF NOT EXISTS exp0004_outbox (
+                        event_id UUID PRIMARY KEY,
+                        transaction_id TEXT NOT NULL UNIQUE,
+                        station_id TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        published_at TIMESTAMPTZ
+                    )
+                    """).update();
+            for (String id : List.of("TX-EXP0004-OUTBOX-NORMAL", "TX-EXP0004-OUTBOX-CRASH",
+                    "TX-EXP0004-OUTBOX-ACK", "TX-EXP0004-OUTBOX-MISMATCH",
+                    "TX-EXP0004-OUTBOX-ROLLBACK")) {
+                send(input, inputTopic, id, 0, "Started", 10000);
+                send(input, inputTopic, id, 1, "Ended", 12500);
+            }
+            var container = factory.createContainer(inputTopic);
+            container.getContainerProperties().setGroupId("exp0004-outbox-inbox-" + UUID.randomUUID());
+            container.getContainerProperties().setPollTimeout(100);
+            container.getContainerProperties().setMessageListener(
+                    (MessageListener<String, String>) listener::consume);
+            container.start();
+            try {
+                await().atMost(Duration.ofSeconds(25)).untilAsserted(() -> {
+                    assertThat(candidate("TX-EXP0004-OUTBOX-NORMAL")).isEqualTo("PROVISIONAL");
+                    assertThat(candidate("TX-EXP0004-OUTBOX-CRASH")).isEqualTo("PROVISIONAL");
+                    assertThat(candidate("TX-EXP0004-OUTBOX-ACK")).isEqualTo("PROVISIONAL");
+                    assertThat(candidate("TX-EXP0004-OUTBOX-MISMATCH")).isEqualTo("PROVISIONAL");
+                    assertThat(candidate("TX-EXP0004-OUTBOX-ROLLBACK")).isEqualTo("PROVISIONAL");
+                });
+
+                assertThat(runOutbox("write", outputTopic, "TX-EXP0004-OUTBOX-NORMAL")).isZero();
+                assertThat(closeoutCount("TX-EXP0004-OUTBOX-NORMAL")).isEqualTo(1);
+                assertThat(outboxCount("TX-EXP0004-OUTBOX-NORMAL", false)).isEqualTo(1);
+                assertThat(runOutbox("relay", outputTopic, "TX-EXP0004-OUTBOX-NORMAL")).isZero();
+                assertThat(outboxCount("TX-EXP0004-OUTBOX-NORMAL", true)).isEqualTo(1);
+                assertThat(readOutput(outputTopic, 1)).containsExactly("TX-EXP0004-OUTBOX-NORMAL");
+
+                assertThat(runOutbox("write-then-halt", outputTopic, "TX-EXP0004-OUTBOX-CRASH"))
+                        .isEqualTo(137);
+                assertThat(Files.readString(directory.resolve("Exp0004OutboxPollingProcess-write-then-halt.log")))
+                        .contains("OUTBOX_COMMITTED_BEFORE_RELAY");
+                assertThat(closeoutCount("TX-EXP0004-OUTBOX-CRASH")).isEqualTo(1);
+                assertThat(outboxCount("TX-EXP0004-OUTBOX-CRASH", false)).isEqualTo(1);
+                assertThat(readOutput(outputTopic, 1)).containsExactly("TX-EXP0004-OUTBOX-NORMAL");
+                assertThat(runOutbox("write", outputTopic, "TX-EXP0004-OUTBOX-CRASH")).isNotZero();
+                assertThat(outboxCount("TX-EXP0004-OUTBOX-CRASH", false)).isEqualTo(1);
+                assertThat(runOutbox("relay", outputTopic, "TX-EXP0004-OUTBOX-CRASH")).isZero();
+                assertThat(outboxCount("TX-EXP0004-OUTBOX-CRASH", true)).isEqualTo(1);
+                assertThat(readOutput(outputTopic, 2)).containsExactly(
+                        "TX-EXP0004-OUTBOX-NORMAL", "TX-EXP0004-OUTBOX-CRASH");
+
+                assertThat(runOutbox("write", outputTopic, "TX-EXP0004-OUTBOX-ACK")).isZero();
+                assertThat(runOutbox("relay-ack-then-halt", outputTopic, "TX-EXP0004-OUTBOX-ACK"))
+                        .isEqualTo(137);
+                assertThat(Files.readString(directory.resolve("Exp0004OutboxPollingProcess-relay-ack-then-halt.log")))
+                        .contains("ACKED_BEFORE_MARK");
+                assertThat(outboxCount("TX-EXP0004-OUTBOX-ACK", false)).isEqualTo(1);
+                assertThat(readOutput(outputTopic, 3)).containsExactly(
+                        "TX-EXP0004-OUTBOX-NORMAL", "TX-EXP0004-OUTBOX-CRASH", "TX-EXP0004-OUTBOX-ACK");
+                assertThat(runOutbox("relay", outputTopic, "TX-EXP0004-OUTBOX-ACK")).isZero();
+                assertThat(outboxCount("TX-EXP0004-OUTBOX-ACK", true)).isEqualTo(1);
+                assertThat(readOutput(outputTopic, 4)).containsExactly(
+                        "TX-EXP0004-OUTBOX-NORMAL", "TX-EXP0004-OUTBOX-CRASH",
+                        "TX-EXP0004-OUTBOX-ACK", "TX-EXP0004-OUTBOX-ACK");
+                var eventIds = readOutputEventIds(outputTopic, 4);
+                assertThat(eventIds).containsExactly(
+                        outboxEventId("TX-EXP0004-OUTBOX-NORMAL"),
+                        outboxEventId("TX-EXP0004-OUTBOX-CRASH"),
+                        outboxEventId("TX-EXP0004-OUTBOX-ACK"),
+                        outboxEventId("TX-EXP0004-OUTBOX-ACK"));
+                assertThat(eventIds.stream().distinct().count()).isEqualTo(3);
+
+                assertThat(runOutbox("write", outputTopic, "TX-EXP0004-OUTBOX-MISMATCH", "2600"))
+                        .isNotZero();
+                assertThat(closeoutCount("TX-EXP0004-OUTBOX-MISMATCH")).isZero();
+                assertThat(outboxCount("TX-EXP0004-OUTBOX-MISMATCH", false)).isZero();
+                assertThat(runOutbox("write-rollback-before-outbox", outputTopic,
+                        "TX-EXP0004-OUTBOX-ROLLBACK")).isNotZero();
+                assertThat(closeoutCount("TX-EXP0004-OUTBOX-ROLLBACK")).isZero();
+                assertThat(outboxCount("TX-EXP0004-OUTBOX-ROLLBACK", false)).isZero();
+                assertThat(readOutput(outputTopic, 4)).hasSize(4);
+            } finally {
+                container.stop();
+            }
+        }
+    }
+
     private void send(KafkaProducer<String, String> producer, String topic, String transactionId,
                       int seq, String stage, int wh) throws Exception {
         String time = seq == 0 ? "2026-01-01T10:00:00Z" : "2026-01-01T10:20:00Z";
@@ -254,6 +363,28 @@ class Exp0004DirectPublishBaselineTest {
                 """).param("id", transactionId).query(Long.class).single();
     }
 
+    private long outboxCount(String transactionId, boolean published) {
+        return jdbc.sql("""
+                SELECT count(*) FROM exp0004_outbox
+                WHERE transaction_id = :id AND published_at IS %s NULL
+                """.formatted(published ? "NOT" : ""))
+                .param("id", transactionId).query(Long.class).single();
+    }
+
+    private String outboxEventId(String transactionId) {
+        return jdbc.sql("SELECT event_id FROM exp0004_outbox WHERE transaction_id = :id")
+                .param("id", transactionId).query(UUID.class).single().toString();
+    }
+
+    private int runOutbox(String mode, String outputTopic, String transactionId) throws Exception {
+        return runOutbox(mode, outputTopic, transactionId, "2500");
+    }
+
+    private int runOutbox(String mode, String outputTopic, String transactionId, String expectedWh)
+            throws Exception {
+        return runChild(Exp0004OutboxPollingProcess.class, mode, outputTopic, transactionId, expectedWh);
+    }
+
     private int runChild(String mode, String outputTopic, String transactionId) throws Exception {
         return runChild(mode, outputTopic, transactionId, "2500");
     }
@@ -283,6 +414,14 @@ class Exp0004DirectPublishBaselineTest {
     }
 
     private List<String> readOutput(String topic, int expected) {
+        return readOutputField(topic, expected, false);
+    }
+
+    private List<String> readOutputEventIds(String topic, int expected) {
+        return readOutputField(topic, expected, true);
+    }
+
+    private List<String> readOutputField(String topic, int expected, boolean eventId) {
         var partition = new TopicPartition(topic, 0);
         try (var consumer = new KafkaConsumer<String, String>(Map.of(
                 ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString(),
@@ -298,7 +437,9 @@ class Exp0004DirectPublishBaselineTest {
                 consumer.poll(Duration.ofMillis(200)).forEach(record -> {
                     assertThat(record.key()).isEqualTo("ST-TEST");
                     try {
-                        found.add(mapper.readTree(record.value()).path("payload").path("transactionId").asText());
+                        var body = mapper.readTree(record.value());
+                        found.add(eventId ? body.path("eventId").asText()
+                                : body.path("payload").path("transactionId").asText());
                     } catch (Exception exception) {
                         throw new IllegalStateException(exception);
                     }
