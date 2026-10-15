@@ -36,7 +36,7 @@ import java.util.concurrent.atomic.LongAdder;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-/** Opt-in burst-drain pilot. Each run requires a fresh isolated Compose stack. */
+/** Opt-in burst-drain measurement. Each run requires a fresh isolated Compose stack. */
 class Exp0003OutboxBurstTest {
     private static final String BOOTSTRAP = "127.0.0.1:19093";
     private static final String TOPIC = "exp0003.outbox";
@@ -112,6 +112,7 @@ class Exp0003OutboxBurstTest {
             var eventIds = new HashSet<UUID>();
             var keys = new HashSet<String>();
             var partition = new TopicPartition(TOPIC, 0);
+            long drainNs = -1;
             try (var consumer = new KafkaConsumer<String, String>(Map.of(
                     ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP,
                     ConsumerConfig.GROUP_ID_CONFIG, "exp0003-burst-" + UUID.randomUUID(),
@@ -130,13 +131,16 @@ class Exp0003OutboxBurstTest {
                         assertThat(payload.path("version").asInt()).isEqualTo(1);
                         assertThat(id).isEqualTo(UUID.nameUUIDFromBytes(
                                 ("exp0003:" + key).getBytes(StandardCharsets.UTF_8)));
-                        eventIds.add(id);
+                        boolean firstObservation = eventIds.add(id);
                         keys.add(key);
                         observedAtMs.add((System.nanoTime() - start) / 1_000_000.0);
+                        if (firstObservation && eventIds.size() == expected && drainNs < 0) {
+                            drainNs = System.nanoTime() - start;
+                        }
                     }
                 }
             }
-            long drainNs = System.nanoTime() - start;
+            assertThat(drainNs).isPositive();
             if (polling != null) assertThat(polling.get(10, TimeUnit.SECONDS)).isEqualTo(expected);
             assertThat(eventIds).hasSize(expected);
             assertThat(keys).hasSize(expected);
