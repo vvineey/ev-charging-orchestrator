@@ -2,6 +2,12 @@ package com.evcharging.controlplane.transaction;
 
 import com.evcharging.ocppgateway.OcppGatewayApplication;
 import io.zonky.test.db.postgres.embedded.EmbeddedPostgres;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
@@ -250,6 +256,7 @@ class OcppGatewayToInboxIntegrationTest {
                     SELECT count(*) FROM transaction_session_candidate
                     WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
                     """).param("id", transactionId).query(Long.class).single()).isZero();
+            assertSameSourceReplayPreservesHold(transactionId);
         } finally {
             if (process != null) {
                 process.destroyForcibly();
@@ -257,6 +264,67 @@ class OcppGatewayToInboxIntegrationTest {
             }
             for (var entry : originals.entrySet()) Files.write(entry.getKey(), entry.getValue());
         }
+    }
+
+    private void assertSameSourceReplayPreservesHold(String transactionId) throws Exception {
+        String source = jdbc.sql("""
+                SELECT jsonb_build_object(
+                    'eventId', first_event_id,
+                    'eventType', 'OcppTransactionEventObserved',
+                    'schemaVersion', 1,
+                    'occurredAt', source_document->'occurredAt',
+                    'receivedAt', first_received_at,
+                    'stationId', source_document->'stationId',
+                    'chargingStationId', source_document->'chargingStationId',
+                    'payload', source_document->'payload')::text
+                FROM transaction_inbox_event
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                  AND event_type = 'Ended'
+                """).param("id", transactionId).query(String.class).single();
+        long eventCount = jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_event
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single();
+        String updatedAt = jdbc.sql("""
+                SELECT updated_at::text FROM transaction_inbox_state
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(String.class).single();
+        String topic = "charging.transaction.observed.v1";
+        var partition = new TopicPartition(topic, 0);
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()));
+             var producer = new KafkaProducer<String, String>(Map.of(
+                     ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString(),
+                     ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.ACKS_CONFIG, "all"))) {
+            long replayOffset = producer.send(new ProducerRecord<>(topic, 0, "ST-E2E", source))
+                    .get(10, TimeUnit.SECONDS).offset();
+            await().atMost(Duration.ofSeconds(25)).untilAsserted(() -> assertThat(
+                    admin.listConsumerGroupOffsets(TransactionRecordListener.GROUP_ID)
+                            .partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS)
+                            .get(partition).offset()).isGreaterThan(replayOffset));
+        }
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_event
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single()).isEqualTo(eventCount);
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_conflict
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("""
+                SELECT count(*) FROM transaction_session_candidate
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single()).isZero();
+        assertThat(jdbc.sql("""
+                SELECT hold_reason FROM transaction_inbox_state
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(String.class).single())
+                .isEqualTo("METER_POLICY_PENDING");
+        assertThat(jdbc.sql("""
+                SELECT updated_at::text FROM transaction_inbox_state
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(String.class).single()).isEqualTo(updatedAt);
     }
 
     private ConfigurableApplicationContext startGateway(LocalTls tls, String chargingStationId) {
