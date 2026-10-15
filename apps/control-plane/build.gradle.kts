@@ -34,4 +34,15 @@ tasks.test {
     systemProperty("transaction.test.runtime-classpath", sourceSets.test.get().runtimeClasspath.asPath)
     systemProperty("transaction.test.comparison-output",
             layout.buildDirectory.file("experiment-results/exp-0002-candidate-correctness.json").get().asFile.absolutePath)
+    systemProperty("exp0003.cdc.enabled", project.findProperty("exp0003Cdc")?.toString() ?: "false")
+    systemProperty("exp0003.cdc.compose-file",
+            rootProject.layout.projectDirectory.file("load-tests/outbox/compose.yaml").asFile.absolutePath)
+    systemProperty("exp0003.cdc.connector-file",
+            rootProject.layout.projectDirectory.file("load-tests/outbox/connector.json").asFile.absolutePath)
+    systemProperty("exp0003.burst.enabled", project.findProperty("exp0003Burst")?.toString() ?: "false")
+    systemProperty("exp0003.burst.mode", project.findProperty("exp0003BurstMode")?.toString() ?: "POLLING")
+    systemProperty("exp0003.burst.batch-size", project.findProperty("exp0003BurstBatchSize")?.toString() ?: "1")
+    systemProperty("exp0003.burst.events", project.findProperty("exp0003BurstEvents")?.toString() ?: "1000")
+    systemProperty("exp0003.burst.output", project.findProperty("exp0003BurstOutput")?.toString()
+            ?: layout.buildDirectory.file("experiment-results/exp0003-burst-result.json").get().asFile.absolutePath)
 }
