@@ -59,6 +59,8 @@ import static org.awaitility.Awaitility.await;
         bootstrapServersProperty = "spring.kafka.bootstrap-servers",
         brokerProperties = "offsets.topic.num.partitions=1")
 class OcppGatewayToInboxIntegrationTest {
+    private static final boolean PROVISIONAL_SAP_TEST =
+            Boolean.parseBoolean(System.getenv("EVC_SAP_INBOX_PROVISIONAL"));
     private static final EmbeddedPostgres POSTGRES;
     static {
         try {
@@ -73,6 +75,8 @@ class OcppGatewayToInboxIntegrationTest {
         registry.add("spring.datasource.url", () -> POSTGRES.getJdbcUrl("postgres", "postgres"));
         registry.add("spring.datasource.username", () -> "postgres");
         registry.add("spring.datasource.password", () -> "postgres");
+        registry.add("transaction.recovery.experimental-candidate-calculation-enabled",
+                () -> PROVISIONAL_SAP_TEST);
     }
 
     @AfterAll
@@ -88,6 +92,7 @@ class OcppGatewayToInboxIntegrationTest {
 
     @Test
     void wssGatewayKafkaAndInboxPreserveEvseAbsenceAndAllMeterGroups() throws Exception {
+        Assumptions.assumeFalse(PROVISIONAL_SAP_TEST, "Opt-in SAP run selects the simulator transaction only");
         var tls = new LocalTls(directory);
         try (var gateway = startGateway(tls, "CS-E2E")) {
             int port = Integer.parseInt(gateway.getEnvironment().getRequiredProperty("local.server.port"));
@@ -239,13 +244,14 @@ class OcppGatewayToInboxIntegrationTest {
                 assertThat(jdbc.sql("""
                         SELECT status FROM transaction_inbox_state
                         WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
-                        """).param("id", transactionId).query(String.class).single()).isEqualTo("HOLD");
+                        """).param("id", transactionId).query(String.class).single())
+                        .isEqualTo(PROVISIONAL_SAP_TEST ? "PROVISIONAL" : "HOLD");
             });
             assertThat(jdbc.sql("""
-                    SELECT hold_reason FROM transaction_inbox_state
+                    SELECT coalesce(hold_reason, '') FROM transaction_inbox_state
                     WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
                     """).param("id", transactionId).query(String.class).single())
-                    .isEqualTo("METER_POLICY_PENDING");
+                    .isEqualTo(PROVISIONAL_SAP_TEST ? "" : "METER_POLICY_PENDING");
             assertThat(jdbc.sql("""
                     SELECT jsonb_array_length(source_document->'payload'->'meterValue')
                     FROM transaction_inbox_event
@@ -261,11 +267,27 @@ class OcppGatewayToInboxIntegrationTest {
             assertThat(jdbc.sql("""
                     SELECT count(*) FROM transaction_session_candidate
                     WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
-                    """).param("id", transactionId).query(Long.class).single()).isZero();
+                    """).param("id", transactionId).query(Long.class).single())
+                    .isEqualTo(PROVISIONAL_SAP_TEST ? 1 : 0);
+            if (PROVISIONAL_SAP_TEST) {
+                BigDecimal expectedWh = sapBoundaryWh(transactionId, "Ended", "Transaction.End")
+                        .subtract(sapBoundaryWh(transactionId, "Started", "Transaction.Begin"));
+                assertThat(expectedWh).isPositive();
+                assertThat(jdbc.sql("""
+                        SELECT energy_wh FROM transaction_session_candidate
+                        WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                        """).param("id", transactionId).query(BigDecimal.class).single())
+                        .isEqualByComparingTo(expectedWh);
+                assertThat(jdbc.sql("""
+                        SELECT candidate_status FROM transaction_session_candidate
+                        WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                        """).param("id", transactionId).query(String.class).single())
+                        .isEqualTo("PROVISIONAL");
+            }
             process.destroyForcibly();
             process.waitFor(10, TimeUnit.SECONDS);
             process = null;
-            assertSameSourceReplayPreservesHold(transactionId);
+            assertSameSourceReplayPreservesState(transactionId);
             assertChangedSourceReplayMovesToConflict(transactionId);
         } finally {
             if (process != null) {
@@ -276,7 +298,30 @@ class OcppGatewayToInboxIntegrationTest {
         }
     }
 
-    private void assertSameSourceReplayPreservesHold(String transactionId) throws Exception {
+    private BigDecimal sapBoundaryWh(String transactionId, String eventType, String context) throws Exception {
+        JsonNode source = mapper.readTree(jdbc.sql("""
+                SELECT source_document::text FROM transaction_inbox_event
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                  AND event_type = :eventType
+                """).param("id", transactionId).param("eventType", eventType)
+                .query(String.class).single());
+        BigDecimal value = null;
+        for (JsonNode meter : source.path("payload").path("meterValue")) {
+            for (JsonNode sample : meter.path("sampledValue")) {
+                if (!context.equals(sample.path("context").asText())
+                        || !"Energy.Active.Import.Register".equals(sample.path("measurand").asText())) continue;
+                assertThat(sample.path("unitOfMeasure").path("unit").asText()).isEqualTo("Wh");
+                assertThat(sample.path("location").asText()).isEqualTo("Outlet");
+                BigDecimal observed = sample.path("value").decimalValue();
+                if (value == null) value = observed;
+                else assertThat(observed).isEqualByComparingTo(value);
+            }
+        }
+        assertThat(value).as("SAP must provide an unambiguous " + context + " reading").isNotNull();
+        return value;
+    }
+
+    private void assertSameSourceReplayPreservesState(String transactionId) throws Exception {
         String source = jdbc.sql("""
                 SELECT jsonb_build_object(
                     'eventId', first_event_id,
@@ -311,12 +356,18 @@ class OcppGatewayToInboxIntegrationTest {
         assertThat(jdbc.sql("""
                 SELECT count(*) FROM transaction_session_candidate
                 WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
-                """).param("id", transactionId).query(Long.class).single()).isZero();
+                """).param("id", transactionId).query(Long.class).single())
+                .isEqualTo(PROVISIONAL_SAP_TEST ? 1 : 0);
         assertThat(jdbc.sql("""
-                SELECT hold_reason FROM transaction_inbox_state
+                SELECT status FROM transaction_inbox_state
                 WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
                 """).param("id", transactionId).query(String.class).single())
-                .isEqualTo("METER_POLICY_PENDING");
+                .isEqualTo(PROVISIONAL_SAP_TEST ? "PROVISIONAL" : "HOLD");
+        assertThat(jdbc.sql("""
+                SELECT coalesce(hold_reason, '') FROM transaction_inbox_state
+                WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                """).param("id", transactionId).query(String.class).single())
+                .isEqualTo(PROVISIONAL_SAP_TEST ? "" : "METER_POLICY_PENDING");
         assertThat(jdbc.sql("""
                 SELECT updated_at::text FROM transaction_inbox_state
                 WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
@@ -371,6 +422,8 @@ class OcppGatewayToInboxIntegrationTest {
                     "--spring.kafka.listener.auto-startup=false",
                     "--transaction.ingress.enabled=true",
                     "--transaction.kafka-topic=charging.transaction.observed.v1",
+                    "--transaction.recovery.experimental-candidate-calculation-enabled="
+                            + PROVISIONAL_SAP_TEST,
                     "--transaction.test.group-id=" + TransactionRecordListener.GROUP_ID,
                     "--spring.kafka.consumer.properties[session.timeout.ms]=6000",
                     "--spring.kafka.consumer.properties[heartbeat.interval.ms]=1000");
@@ -398,7 +451,8 @@ class OcppGatewayToInboxIntegrationTest {
         assertThat(jdbc.sql("""
                 SELECT status FROM transaction_inbox_state
                 WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
-                """).param("id", transactionId).query(String.class).single()).isEqualTo("HOLD_CONFLICT");
+                """).param("id", transactionId).query(String.class).single())
+                .isEqualTo(PROVISIONAL_SAP_TEST ? "HOLD_AFTER_PROVISIONAL" : "HOLD_CONFLICT");
         assertThat(jdbc.sql("""
                 SELECT hold_reason FROM transaction_inbox_state
                 WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
@@ -414,7 +468,20 @@ class OcppGatewayToInboxIntegrationTest {
         assertThat(jdbc.sql("""
                 SELECT count(*) FROM transaction_session_candidate
                 WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
-                """).param("id", transactionId).query(Long.class).single()).isZero();
+                """).param("id", transactionId).query(Long.class).single())
+                .isEqualTo(PROVISIONAL_SAP_TEST ? 1 : 0);
+        if (PROVISIONAL_SAP_TEST) {
+            assertThat(jdbc.sql("""
+                    SELECT candidate_status FROM transaction_session_candidate
+                    WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                    """).param("id", transactionId).query(String.class).single())
+                    .isEqualTo("INVALIDATED");
+            assertThat(jdbc.sql("""
+                    SELECT invalidation_reason FROM transaction_session_candidate
+                    WHERE charging_station_id = 'CS-KEBA-OCPP2-00001' AND transaction_id = :id
+                    """).param("id", transactionId).query(String.class).single())
+                    .isEqualTo("SOURCE_CONFLICT");
+        }
 
         publishAndWaitForInboxOffset(changedRecord);
         assertThat(jdbc.sql("""
