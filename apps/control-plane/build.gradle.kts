@@ -45,4 +45,10 @@ tasks.test {
     systemProperty("exp0003.burst.events", project.findProperty("exp0003BurstEvents")?.toString() ?: "1000")
     systemProperty("exp0003.burst.output", project.findProperty("exp0003BurstOutput")?.toString()
             ?: layout.buildDirectory.file("experiment-results/exp0003-burst-result.json").get().asFile.absolutePath)
+    systemProperty("exp0003.steady.enabled", project.findProperty("exp0003Steady")?.toString() ?: "false")
+    systemProperty("exp0003.steady.mode", project.findProperty("exp0003SteadyMode")?.toString() ?: "POLLING")
+    systemProperty("exp0003.steady.rate", project.findProperty("exp0003SteadyRate")?.toString() ?: "200")
+    systemProperty("exp0003.steady.seconds", project.findProperty("exp0003SteadySeconds")?.toString() ?: "5")
+    systemProperty("exp0003.steady.output", project.findProperty("exp0003SteadyOutput")?.toString()
+            ?: layout.buildDirectory.file("experiment-results/exp0003-steady-result.json").get().asFile.absolutePath)
 }

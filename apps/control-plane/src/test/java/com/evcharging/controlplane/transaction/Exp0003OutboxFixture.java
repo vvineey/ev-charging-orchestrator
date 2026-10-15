@@ -11,6 +11,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -153,6 +154,32 @@ final class Exp0003OutboxFixture {
             statement.setObject(1, eventId);
             statement.setString(2, workKey);
             statement.executeUpdate();
+        }
+    }
+
+    static void applyEffects(DataSource dataSource, Map<UUID, String> effects) throws SQLException {
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            try (PreparedStatement statement = connection.prepareStatement("""
+                    INSERT INTO exp0003_effect(event_id, work_key) VALUES (?, ?)
+                    ON CONFLICT (event_id) DO NOTHING
+                    """)) {
+                int pending = 0;
+                for (var effect : effects.entrySet()) {
+                    statement.setObject(1, effect.getKey());
+                    statement.setString(2, effect.getValue());
+                    statement.addBatch();
+                    if (++pending == 500) {
+                        statement.executeBatch();
+                        pending = 0;
+                    }
+                }
+                if (pending > 0) statement.executeBatch();
+                connection.commit();
+            } catch (SQLException | RuntimeException failure) {
+                connection.rollback();
+                throw failure;
+            }
         }
     }
 
