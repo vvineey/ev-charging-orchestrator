@@ -92,7 +92,7 @@ class Exp0004DirectPublishBaselineTest {
             admin.createTopics(List.of(new NewTopic(inputTopic, 1, (short) 1),
                     new NewTopic(outputTopic, 1, (short) 1))).all().get(10, TimeUnit.SECONDS);
             jdbc.sql("""
-                    CREATE TABLE exp0004_closeout (
+                    CREATE TABLE IF NOT EXISTS exp0004_closeout (
                         charging_station_id TEXT NOT NULL,
                         transaction_id TEXT NOT NULL,
                         station_id TEXT NOT NULL,
@@ -129,7 +129,7 @@ class Exp0004DirectPublishBaselineTest {
                 assertThat(runChild("after-commit-before-send", outputTopic, "TX-EXP0004-CRASH"))
                         .isEqualTo(137);
                 assertThat(closeoutCount("TX-EXP0004-CRASH")).isEqualTo(1);
-                assertThat(Files.readString(directory.resolve("after-commit-before-send.log")))
+                assertThat(Files.readString(directory.resolve("Exp0004DirectPublishProcess-after-commit-before-send.log")))
                         .contains("COMMITTED_BEFORE_SEND");
                 assertThat(readOutput(outputTopic, 1)).containsExactly("TX-EXP0004-NORMAL");
 
@@ -137,6 +137,74 @@ class Exp0004DirectPublishBaselineTest {
                         .isNotZero();
                 assertThat(closeoutCount("TX-EXP0004-MISMATCH")).isZero();
                 assertThat(readOutput(outputTopic, 1)).containsExactly("TX-EXP0004-NORMAL");
+            } finally {
+                container.stop();
+            }
+        }
+    }
+
+    @Test
+    void springAfterCommitStillLosesEventWhenProcessHaltsInsideCallback() throws Exception {
+        String inputTopic = "exp0004-after-input-" + UUID.randomUUID();
+        String outputTopic = "exp0004-after-closeout-" + UUID.randomUUID();
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()));
+             var input = new KafkaProducer<String, String>(Map.of(
+                     ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString(),
+                     ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.ACKS_CONFIG, "all"))) {
+            admin.createTopics(List.of(new NewTopic(inputTopic, 1, (short) 1),
+                    new NewTopic(outputTopic, 1, (short) 1))).all().get(10, TimeUnit.SECONDS);
+            jdbc.sql("""
+                    CREATE TABLE IF NOT EXISTS exp0004_closeout (
+                        charging_station_id TEXT NOT NULL,
+                        transaction_id TEXT NOT NULL,
+                        station_id TEXT NOT NULL,
+                        energy_wh NUMERIC(24,6) NOT NULL,
+                        event_id UUID NOT NULL UNIQUE,
+                        PRIMARY KEY (charging_station_id, transaction_id)
+                    )
+                    """).update();
+            for (String id : List.of("TX-EXP0004-AFTER-NORMAL", "TX-EXP0004-AFTER-CRASH",
+                    "TX-EXP0004-AFTER-MISMATCH")) {
+                send(input, inputTopic, id, 0, "Started", 10000);
+                send(input, inputTopic, id, 1, "Ended", 12500);
+            }
+            var container = factory.createContainer(inputTopic);
+            container.getContainerProperties().setGroupId("exp0004-after-inbox-" + UUID.randomUUID());
+            container.getContainerProperties().setPollTimeout(100);
+            container.getContainerProperties().setMessageListener(
+                    (MessageListener<String, String>) listener::consume);
+            container.start();
+            try {
+                await().atMost(Duration.ofSeconds(25)).untilAsserted(() -> {
+                    assertThat(candidate("TX-EXP0004-AFTER-NORMAL")).isEqualTo("PROVISIONAL");
+                    assertThat(candidate("TX-EXP0004-AFTER-CRASH")).isEqualTo("PROVISIONAL");
+                    assertThat(candidate("TX-EXP0004-AFTER-MISMATCH")).isEqualTo("PROVISIONAL");
+                });
+
+                assertThat(runChild(Exp0004AfterCommitProcess.class, "normal", outputTopic,
+                        "TX-EXP0004-AFTER-NORMAL", "2500")).isZero();
+                assertThat(closeoutCount("TX-EXP0004-AFTER-NORMAL")).isEqualTo(1);
+                assertThat(readOutput(outputTopic, 1)).containsExactly("TX-EXP0004-AFTER-NORMAL");
+
+                assertThat(runChild(Exp0004AfterCommitProcess.class, "in-callback-before-send", outputTopic,
+                        "TX-EXP0004-AFTER-CRASH", "2500")).isEqualTo(137);
+                assertThat(closeoutCount("TX-EXP0004-AFTER-CRASH")).isEqualTo(1);
+                assertThat(Files.readString(directory.resolve("Exp0004AfterCommitProcess-in-callback-before-send.log")))
+                        .contains("AFTER_COMMIT_ENTERED_BEFORE_SEND");
+                assertThat(readOutput(outputTopic, 1)).containsExactly("TX-EXP0004-AFTER-NORMAL");
+
+                // Retrying the same closeout cannot register a new callback after the unique row exists.
+                assertThat(runChild(Exp0004AfterCommitProcess.class, "normal", outputTopic,
+                        "TX-EXP0004-AFTER-CRASH", "2500")).isNotZero();
+                assertThat(closeoutCount("TX-EXP0004-AFTER-CRASH")).isEqualTo(1);
+                assertThat(readOutput(outputTopic, 1)).containsExactly("TX-EXP0004-AFTER-NORMAL");
+
+                assertThat(runChild(Exp0004AfterCommitProcess.class, "normal", outputTopic,
+                        "TX-EXP0004-AFTER-MISMATCH", "2600")).isNotZero();
+                assertThat(closeoutCount("TX-EXP0004-AFTER-MISMATCH")).isZero();
+                assertThat(readOutput(outputTopic, 1)).containsExactly("TX-EXP0004-AFTER-NORMAL");
             } finally {
                 container.stop();
             }
@@ -192,15 +260,20 @@ class Exp0004DirectPublishBaselineTest {
 
     private int runChild(String mode, String outputTopic, String transactionId, String expectedWh)
             throws Exception {
+        return runChild(Exp0004DirectPublishProcess.class, mode, outputTopic, transactionId, expectedWh);
+    }
+
+    private int runChild(Class<?> processClass, String mode, String outputTopic,
+                         String transactionId, String expectedWh) throws Exception {
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         String classpath = System.getProperty("transaction.test.runtime-classpath");
         assertThat(classpath).isNotBlank();
         var process = new ProcessBuilder(java, "-cp", classpath,
-                Exp0004DirectPublishProcess.class.getName(), mode,
+                processClass.getName(), mode,
                 POSTGRES.getJdbcUrl("postgres", "postgres"), broker.getBrokersAsString(),
                 outputTopic, transactionId, expectedWh)
                 .redirectErrorStream(true)
-                .redirectOutput(directory.resolve(mode + ".log").toFile())
+                .redirectOutput(directory.resolve(processClass.getSimpleName() + "-" + mode + ".log").toFile())
                 .start();
         if (!process.waitFor(30, TimeUnit.SECONDS)) {
             process.destroyForcibly();
