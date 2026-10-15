@@ -188,6 +188,18 @@ class OcppGatewayToInboxIntegrationTest {
                     station.put("supervisionUrlOcppConfiguration", false);
                     station.put("supervisionUser", "CS-KEBA-OCPP2-00001");
                     station.put("supervisionPassword", "test-credential-only");
+                    ObjectNode generator = path.equals(savedStation)
+                            ? (ObjectNode) config.path("automaticTransactionGenerator")
+                            : (ObjectNode) config.path("AutomaticTransactionGenerator");
+                    generator.put("enable", true);
+                    generator.put("minDuration", 35);
+                    generator.put("maxDuration", 35);
+                    generator.put("minDelayBetweenTwoTransactions", 1);
+                    generator.put("maxDelayBetweenTwoTransactions", 1);
+                    generator.put("probabilityOfStart", 1);
+                    generator.put("stopAfterHours", 0.1);
+                    // This ingress test does not implement the separate OCPP Authorize request.
+                    generator.put("requireAuthorize", false);
                 }
                 Files.writeString(path, mapper.writeValueAsString(config));
             }
