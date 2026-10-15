@@ -31,6 +31,8 @@ import tools.jackson.databind.node.ObjectNode;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -314,6 +316,38 @@ class Exp0004DirectPublishBaselineTest {
                 assertThat(closeoutCount("TX-EXP0004-OUTBOX-ROLLBACK")).isZero();
                 assertThat(outboxCount("TX-EXP0004-OUTBOX-ROLLBACK", false)).isZero();
                 assertThat(readOutput(outputTopic, 4)).hasSize(4);
+
+                try (var consumerDatabase = EmbeddedPostgres.builder().start()) {
+                    String consumerJdbcUrl = consumerDatabase.getJdbcUrl("postgres", "postgres");
+                    try (var connection = DriverManager.getConnection(consumerJdbcUrl, "postgres", "postgres");
+                         var statement = connection.createStatement()) {
+                        statement.execute("""
+                                CREATE TABLE exp0004_effect (
+                                    event_id UUID PRIMARY KEY,
+                                    transaction_id TEXT NOT NULL UNIQUE
+                                )
+                                """);
+                    }
+                    String groupId = "exp0004-independent-effect-" + UUID.randomUUID();
+                    assertThat(runConsumer("crash-after-db", outputTopic, consumerJdbcUrl, groupId, 1))
+                            .isEqualTo(137);
+                    assertThat(Files.readString(directory.resolve("Exp0004IndependentConsumerProcess-crash-after-db.log")))
+                            .contains("EFFECT_COMMITTED offset=0");
+                    assertThat(effectCount(consumerJdbcUrl, null)).isEqualTo(1);
+                    assertThat(runConsumer("normal", outputTopic, consumerJdbcUrl, groupId, 4)).isZero();
+                    assertThat(Files.readString(directory.resolve("Exp0004IndependentConsumerProcess-normal.log")))
+                            .contains("EFFECT_COMMITTED offset=0").contains("CONSUMED 4");
+                    var committedOffset = admin.listConsumerGroupOffsets(groupId)
+                            .partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS)
+                            .get(new TopicPartition(outputTopic, 0));
+                    assertThat(committedOffset).isNotNull();
+                    assertThat(committedOffset.offset()).isEqualTo(4);
+                    assertThat(effectCount(consumerJdbcUrl, null)).isEqualTo(3);
+                    for (String id : List.of("TX-EXP0004-OUTBOX-NORMAL", "TX-EXP0004-OUTBOX-CRASH",
+                            "TX-EXP0004-OUTBOX-ACK")) {
+                        assertThat(effectCount(consumerJdbcUrl, id)).isEqualTo(1);
+                    }
+                }
             } finally {
                 container.stop();
             }
@@ -383,6 +417,37 @@ class Exp0004DirectPublishBaselineTest {
     private int runOutbox(String mode, String outputTopic, String transactionId, String expectedWh)
             throws Exception {
         return runChild(Exp0004OutboxPollingProcess.class, mode, outputTopic, transactionId, expectedWh);
+    }
+
+    private int runConsumer(String mode, String outputTopic, String consumerJdbcUrl,
+                            String groupId, int expectedRecords) throws Exception {
+        String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        String classpath = System.getProperty("transaction.test.runtime-classpath");
+        assertThat(classpath).isNotBlank();
+        var process = new ProcessBuilder(java, "-cp", classpath,
+                Exp0004IndependentConsumerProcess.class.getName(), mode, broker.getBrokersAsString(),
+                outputTopic, consumerJdbcUrl, groupId, Integer.toString(expectedRecords))
+                .redirectErrorStream(true)
+                .redirectOutput(directory.resolve("Exp0004IndependentConsumerProcess-" + mode + ".log").toFile())
+                .start();
+        if (!process.waitFor(45, TimeUnit.SECONDS)) {
+            process.destroyForcibly();
+            throw new IllegalStateException("independent consumer child did not finish");
+        }
+        return process.exitValue();
+    }
+
+    private long effectCount(String consumerJdbcUrl, String transactionId) throws SQLException {
+        try (var connection = DriverManager.getConnection(consumerJdbcUrl, "postgres", "postgres");
+             var statement = connection.prepareStatement(transactionId == null
+                     ? "SELECT count(*) FROM exp0004_effect"
+                     : "SELECT count(*) FROM exp0004_effect WHERE transaction_id = ?")) {
+            if (transactionId != null) statement.setString(1, transactionId);
+            try (var rows = statement.executeQuery()) {
+                rows.next();
+                return rows.getLong(1);
+            }
+        }
     }
 
     private int runChild(String mode, String outputTopic, String transactionId) throws Exception {
