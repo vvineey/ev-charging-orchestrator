@@ -46,7 +46,7 @@ import static org.awaitility.Awaitility.await;
 /** Correctness-only comparison. A/B are intentionally small in-memory baselines; C is the real Kafka/PG Inbox. */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
         properties = {"transaction.ingress.enabled=true", "spring.kafka.listener.auto-startup=false",
-                "transaction.recovery.experimental-session-confirmation-enabled=true"})
+                "transaction.recovery.experimental-candidate-calculation-enabled=true"})
 @EmbeddedKafka(partitions = 1, topics = "transaction-comparison-bootstrap",
         bootstrapServersProperty = "spring.kafka.bootstrap-servers",
         brokerProperties = "offsets.topic.num.partitions=1")
@@ -253,14 +253,16 @@ class TransactionRecoveryCandidateComparisonTest {
                 WHERE charging_station_id = 'CS-COMPARE' AND transaction_id = :id
                 """).param("id", transactionId).query(String.class).single();
         int count = jdbc.sql("""
-                SELECT count(*) FROM recovered_transaction_session
+                SELECT count(*) FROM transaction_session_candidate
                 WHERE charging_station_id = 'CS-COMPARE' AND transaction_id = :id
                 """).param("id", transactionId).query(Long.class).single().intValue();
         Integer wh = count == 0 ? null : jdbc.sql("""
-                SELECT energy_wh FROM recovered_transaction_session
+                SELECT energy_wh FROM transaction_session_candidate
                 WHERE charging_station_id = 'CS-COMPARE' AND transaction_id = :id
                 """).param("id", transactionId).query(java.math.BigDecimal.class).single().intValueExact();
-        return new Result(status.startsWith("HOLD") ? "HOLD" : status, wh, count);
+        // The historical comparison scores calculated Wh. PROVISIONAL is not billable.
+        String comparisonStatus = "PROVISIONAL".equals(status) ? "FINALIZED" : status;
+        return new Result(comparisonStatus.startsWith("HOLD") ? "HOLD" : comparisonStatus, wh, count);
     }
 
     private String observed(String transactionId, Event event) {
