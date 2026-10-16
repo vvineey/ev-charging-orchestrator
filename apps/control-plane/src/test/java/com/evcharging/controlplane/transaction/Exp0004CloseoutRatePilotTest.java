@@ -105,6 +105,9 @@ class Exp0004CloseoutRatePilotTest {
         if (RATE < 1 || SECONDS < 1 || EXPECTED > 20_000) {
             throw new IllegalArgumentException("Rate and seconds must produce 1..20000 closeouts");
         }
+        Path progress = Path.of("build", "experiment-results", "exp-0004-prep-progress.txt");
+        Files.createDirectories(progress.getParent());
+        Files.writeString(progress, "STARTED " + Instant.now() + " planned=" + EXPECTED + "\n");
         String relayMode = System.getenv().getOrDefault("EVC_EXP0004_RELAY_MODE", "SEQUENTIAL");
         if (!relayMode.equals("SEQUENTIAL") && !relayMode.equals("BATCH_ACK")) {
             throw new IllegalArgumentException("Unsupported relay mode: " + relayMode);
@@ -133,6 +136,8 @@ class Exp0004CloseoutRatePilotTest {
                     send(input, inputTopic, transactionId, 1, "Ended", 12500);
                     if ((i + 1) % 5000 == 0 || i + 1 == EXPECTED) {
                         System.out.println("EXP0004_PREP_SENT " + (i + 1));
+                        Files.writeString(progress, "PREP_SENT " + Instant.now()
+                                + " transactions=" + (i + 1) + "\n");
                     }
                 }
                 await().atMost(Duration.ofSeconds(120)).untilAsserted(() -> {
@@ -140,6 +145,8 @@ class Exp0004CloseoutRatePilotTest {
                     assertThat(validCandidateCount(prefix)).isEqualTo(EXPECTED);
                 });
                 System.out.println("EXP0004_PREP_CANDIDATES_READY " + EXPECTED);
+                Files.writeString(progress, "CANDIDATES_READY " + Instant.now()
+                        + " transactions=" + EXPECTED + "\n");
                 runRatePilot(run, prefix, outputTopic, brokers, output, relayMode);
             } finally {
                 inbox.stop();
