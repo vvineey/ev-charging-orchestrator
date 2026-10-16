@@ -65,9 +65,11 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
         bootstrapServersProperty = "spring.kafka.bootstrap-servers",
         brokerProperties = "offsets.topic.num.partitions=1")
 class Exp0004CloseoutRatePilotTest {
-    private static final int RATE = 200;
-    private static final int SECONDS = 5;
-    private static final int EXPECTED = RATE * SECONDS;
+    private static final int RATE = Integer.parseInt(
+            System.getenv().getOrDefault("EVC_EXP0004_RATE_PER_SECOND", "200"));
+    private static final int SECONDS = Integer.parseInt(
+            System.getenv().getOrDefault("EVC_EXP0004_SECONDS", "5"));
+    private static final int EXPECTED = Math.multiplyExact(RATE, SECONDS);
     private static final BigDecimal WH = new BigDecimal("2500");
     private static final EmbeddedPostgres POSTGRES;
     static {
@@ -100,6 +102,12 @@ class Exp0004CloseoutRatePilotTest {
     @Test
     void measuresOcppDerivedCloseoutCommitToKafkaObservation() throws Exception {
         assumeTrue("true".equalsIgnoreCase(System.getenv("EVC_EXP0004_RATE_PILOT")));
+        if (RATE < 1 || SECONDS < 1 || EXPECTED > 20_000) {
+            throw new IllegalArgumentException("Rate and seconds must produce 1..20000 closeouts");
+        }
+        Path progress = Path.of("build", "experiment-results", "exp-0004-prep-progress.txt");
+        Files.createDirectories(progress.getParent());
+        Files.writeString(progress, "STARTED " + Instant.now() + " planned=" + EXPECTED + "\n");
         String relayMode = System.getenv().getOrDefault("EVC_EXP0004_RELAY_MODE", "SEQUENTIAL");
         if (!relayMode.equals("SEQUENTIAL") && !relayMode.equals("BATCH_ACK")) {
             throw new IllegalArgumentException("Unsupported relay mode: " + relayMode);
@@ -126,11 +134,19 @@ class Exp0004CloseoutRatePilotTest {
                     String transactionId = prefix + i;
                     send(input, inputTopic, transactionId, 0, "Started", 10000);
                     send(input, inputTopic, transactionId, 1, "Ended", 12500);
+                    if ((i + 1) % 5000 == 0 || i + 1 == EXPECTED) {
+                        System.out.println("EXP0004_PREP_SENT " + (i + 1));
+                        Files.writeString(progress, "PREP_SENT " + Instant.now()
+                                + " transactions=" + (i + 1) + "\n");
+                    }
                 }
                 await().atMost(Duration.ofSeconds(120)).untilAsserted(() -> {
                     assertThat(candidateCount(prefix)).isEqualTo(EXPECTED);
                     assertThat(validCandidateCount(prefix)).isEqualTo(EXPECTED);
                 });
+                System.out.println("EXP0004_PREP_CANDIDATES_READY " + EXPECTED);
+                Files.writeString(progress, "CANDIDATES_READY " + Instant.now()
+                        + " transactions=" + EXPECTED + "\n");
                 runRatePilot(run, prefix, outputTopic, brokers, output, relayMode);
             } finally {
                 inbox.stop();
@@ -380,6 +396,7 @@ class Exp0004CloseoutRatePilotTest {
             result.put("issue", 60);
             result.put("mode", "OCPP-derived test closeout + single batch-16 Polling Relay");
             result.put("comparisonIssue", 62);
+            if (EXPECTED == 20_000) result.put("durationIssue", 64);
             result.put("relayMode", relayMode);
             result.put("ratePerSecond", RATE);
             result.put("seconds", SECONDS);
@@ -410,6 +427,7 @@ class Exp0004CloseoutRatePilotTest {
             result.put("p50PerRowDbMarkMs", percentile(markDurations, 0.50));
             result.put("p95PerRowDbMarkMs", percentile(markDurations, 0.95));
             result.put("javaVersion", System.getProperty("java.version"));
+            result.put("javaTempDir", System.getProperty("java.io.tmpdir"));
             result.put("postgresVersion", jdbc.sql("SHOW server_version").query(String.class).single());
             result.put("kafkaPartitions", 1);
             result.put("kafkaReplicas", 1);
@@ -418,13 +436,15 @@ class Exp0004CloseoutRatePilotTest {
             result.put("relayBatch", 16);
             result.set("samples", mapper.valueToTree(samples));
             Path output = Path.of("build", "experiment-results",
-                    "exp-0004-rate-pilot-" + relayMode.toLowerCase() + ".json");
+                    "exp-0004-rate-" + RATE + "x" + SECONDS
+                            + "-" + relayMode.toLowerCase() + ".json");
             Files.createDirectories(output.getParent());
             Files.writeString(output, mapper.writerWithDefaultPrettyPrinter().writeValueAsString(result));
             result.remove("samples");
             System.out.println("EXP0004_RATE_RESULT " + mapper.writeValueAsString(result));
 
-            assertThat(committedBeforeEnd).as("offered-load generator validity").isGreaterThanOrEqualTo(950);
+            assertThat(committedBeforeEnd).as("offered-load generator validity")
+                    .isGreaterThanOrEqualTo((long) Math.ceil(EXPECTED * 0.95));
             assertThat(committedAt).hasSize(EXPECTED);
             assertThat(closeouts).isEqualTo(EXPECTED);
             assertThat(outbox).isEqualTo(EXPECTED);
