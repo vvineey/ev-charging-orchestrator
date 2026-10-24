@@ -41,6 +41,8 @@ tasks.test {
     systemProperty("transaction.test.isolated-mode", project.findProperty("performanceIsolatedMode")?.toString() ?: "")
     systemProperty("transaction.test.isolated-rate", project.findProperty("performanceIsolatedRate")?.toString() ?: "20")
     systemProperty("transaction.test.isolated-run", project.findProperty("performanceIsolatedRun")?.toString() ?: "1")
+    systemProperty("transaction.test.restore-from-inbox",
+            project.findProperty("performanceRestoreFromInbox")?.toString() ?: "false")
     systemProperty("transaction.test.isolated-output-dir",
             layout.buildDirectory.dir("experiment-results").get().asFile.absolutePath)
     systemProperty("exp0003.cdc.enabled", project.findProperty("exp0003Cdc")?.toString() ?: "false")

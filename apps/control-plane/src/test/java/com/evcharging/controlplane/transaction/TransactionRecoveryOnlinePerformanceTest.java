@@ -50,6 +50,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -121,11 +122,16 @@ class TransactionRecoveryOnlinePerformanceTest {
 
     record TableBytes(long source, long state, long candidate) { }
 
+    record DatabaseActivity(long blocksRead, long blocksHit, long tuplesReturned,
+                            long tuplesFetched, long tuplesInserted, long tuplesUpdated) { }
+
     record IsolatedReport(String scope, String mode, String run, int requestedRecordsPerSecond,
-                          int windowSeconds, String javaVersion, String osName,
+                          int windowSeconds, boolean restoreFromInbox, String javaVersion, String osName,
                           String databaseVersion, long processCpuNanos,
                           long heapUsedBeforeBytes, long heapUsedAfterBytes,
-                          TableBytes before, TableBytes after, ModeResult result) { }
+                          TableBytes before, TableBytes after,
+                          DatabaseActivity databaseBefore, DatabaseActivity databaseAfter,
+                          ModeResult result) { }
 
     @Test
     @EnabledIfSystemProperty(named = "transaction.test.isolated-mode", matches = "A|B|C")
@@ -133,14 +139,18 @@ class TransactionRecoveryOnlinePerformanceTest {
         String mode = System.getProperty("transaction.test.isolated-mode");
         String runLabel = System.getProperty("transaction.test.isolated-run");
         int requestedRate = Integer.parseInt(System.getProperty("transaction.test.isolated-rate"));
+        boolean restoreFromInbox = Boolean.getBoolean("transaction.test.restore-from-inbox");
         assertThat(requestedRate).isPositive();
         TableBytes before = tableBytes();
+        DatabaseActivity databaseBefore = databaseActivity();
         long heapBefore = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
         var operatingSystem = (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
         long cpuBefore = operatingSystem.getProcessCpuTime();
         int expectedCandidates = "A".equals(mode) ? TRANSACTIONS_PER_MODE / 2 : TRANSACTIONS_PER_MODE;
         ModeResult result;
-        try (CandidateAdapter candidate = "C".equals(mode) ? null : adapter(mode, WINDOW_SECONDS);
+        try (CandidateAdapter candidate = "C".equals(mode) ? null
+                : new CandidateAdapter(mode, WINDOW_SECONDS, inbox, rules, transactions,
+                        jdbc, restoreFromInbox);
              Run started = start(mode, candidate, requestedRate)) {
             result = finish(started, candidate, expectedCandidates,
                     Duration.ofSeconds(WINDOW_SECONDS + 60));
@@ -148,20 +158,34 @@ class TransactionRecoveryOnlinePerformanceTest {
         long cpuNanos = operatingSystem.getProcessCpuTime() - cpuBefore;
         long heapAfter = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
         TableBytes after = tableBytes();
+        DatabaseActivity databaseAfter = databaseActivity();
         Path output = Path.of(System.getProperty("transaction.test.isolated-output-dir"),
-                "exp-0002-isolated-" + mode + "-" + runLabel + ".json");
+                "exp-0002-isolated-" + mode + (restoreFromInbox ? "-restored-" : "-baseline-")
+                        + runLabel + ".json");
         Files.createDirectories(output.getParent());
         Files.writeString(output, mapper.writeValueAsString(new IsolatedReport(
                 "single-candidate-embedded-resource-pilot-not-final-e5", mode, runLabel,
-                requestedRate, WINDOW_SECONDS, System.getProperty("java.version"),
+                requestedRate, WINDOW_SECONDS, restoreFromInbox, System.getProperty("java.version"),
                 System.getProperty("os.name"), jdbc.sql("SELECT version()").query(String.class).single(),
-                cpuNanos, heapBefore, heapAfter, before, after, result)));
+                cpuNanos, heapBefore, heapAfter, before, after,
+                databaseBefore, databaseAfter, result)));
     }
 
     private TableBytes tableBytes() {
         return new TableBytes(relationBytes("transaction_inbox_event"),
                 relationBytes("transaction_inbox_state"),
                 relationBytes("transaction_session_candidate"));
+    }
+
+    private DatabaseActivity databaseActivity() {
+        return jdbc.sql("""
+                SELECT blks_read, blks_hit, tup_returned, tup_fetched,
+                       tup_inserted, tup_updated
+                FROM pg_stat_database WHERE datname = current_database()
+                """).query((rs, row) -> new DatabaseActivity(
+                rs.getLong("blks_read"), rs.getLong("blks_hit"),
+                rs.getLong("tup_returned"), rs.getLong("tup_fetched"),
+                rs.getLong("tup_inserted"), rs.getLong("tup_updated"))).single();
     }
 
     private long relationBytes(String table) {
@@ -280,6 +304,144 @@ class TransactionRecoveryOnlinePerformanceTest {
         assertThat(countForTransaction("transaction_session_candidate", id)).isZero();
     }
 
+    @Test
+    void jvmHaltBetweenDatabaseCommitAndOffsetCommitReplaysAllThreeCandidates()
+            throws Exception {
+        verifyJvmHaltBeforeOffsetCommit(false);
+        verifyJvmHaltBeforeOffsetCommit(true);
+    }
+
+    private void verifyJvmHaltBeforeOffsetCommit(boolean restoreFromInbox) throws Exception {
+        String runId = UUID.randomUUID().toString();
+        Map<String, String> topics = Map.of(
+                "A", "transaction-gap-A-" + runId,
+                "B", "transaction-gap-B-" + runId,
+                "C", "transaction-gap-C-" + runId);
+        Map<String, String> ids = Map.of(
+                "A", "gap-A-" + runId,
+                "B", "gap-B-" + runId,
+                "C", "gap-C-" + runId);
+        String bootstrap = broker.getBrokersAsString();
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", bootstrap));
+             var producer = new KafkaProducer<String, String>(Map.of(
+                     ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap,
+                     ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.ACKS_CONFIG, "all"))) {
+            admin.createTopics(topics.values().stream().map(topic -> new NewTopic(topic, 1, (short) 1))
+                    .toList()).all().get(10, TimeUnit.SECONDS);
+            Process first = startCandidateProcess(topics, 30,
+                    (restoreFromInbox ? "restored-" : "baseline-") + "gap-before-halt",
+                    restoreFromInbox, true);
+            try {
+                for (String mode : List.of("A", "B", "C")) {
+                    producer.send(new ProducerRecord<>(topics.get(mode), 0, "ST-BENCH",
+                            observed(ids.get(mode), 0))).get(10, TimeUnit.SECONDS);
+                }
+                await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertThat(first.isAlive()).isTrue();
+                    for (String mode : List.of("A", "B", "C")) {
+                        assertThat(countForTransaction("transaction_inbox_event", ids.get(mode)))
+                                .isEqualTo(1);
+                        assertThat(offset(admin, topics.get(mode), topics.get(mode)))
+                                .as("uncommitted offset for %s", mode).isZero();
+                    }
+                });
+            } finally {
+                first.destroyForcibly();
+                assertThat(first.waitFor(10, TimeUnit.SECONDS)).isTrue();
+            }
+            assertThat(first.exitValue()).isNotZero();
+
+            Process second = startCandidateProcess(topics, 30,
+                    (restoreFromInbox ? "restored-" : "baseline-") + "gap-after-halt",
+                    restoreFromInbox);
+            try {
+                for (String mode : List.of("A", "B", "C")) {
+                    producer.send(new ProducerRecord<>(topics.get(mode), 0, "ST-BENCH",
+                            observed(ids.get(mode), 1))).get(10, TimeUnit.SECONDS);
+                }
+                await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertThat(second.isAlive()).isTrue();
+                    for (String mode : List.of("A", "B", "C")) {
+                        assertThat(offset(admin, topics.get(mode), topics.get(mode))).isEqualTo(2);
+                        assertThat(countForTransaction("transaction_inbox_event", ids.get(mode)))
+                                .isEqualTo(2);
+                    }
+                });
+                await().atMost(Duration.ofSeconds(40)).untilAsserted(() -> {
+                    for (String mode : List.of("A", "B", "C")) {
+                        assertThat(countForTransaction("transaction_session_candidate", ids.get(mode)))
+                                .as("provisional candidate after replay for %s", mode)
+                                .isEqualTo(!restoreFromInbox && "A".equals(mode) ? 0 : 1);
+                    }
+                });
+                for (String mode : List.of("A", "B", "C")) {
+                    if (!restoreFromInbox && "A".equals(mode)) continue;
+                    assertThat(jdbc.sql("""
+                            SELECT energy_wh FROM transaction_session_candidate
+                            WHERE transaction_id = :id
+                            """).param("id", ids.get(mode)).query(Integer.class).single())
+                            .isEqualTo(2500);
+                }
+            } finally {
+                second.destroyForcibly();
+                assertThat(second.waitFor(10, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
+    @Test
+    void restoredWindowTimerFiresAfterJvmRestartWithoutAnotherRecord() throws Exception {
+        String runId = UUID.randomUUID().toString();
+        String bId = "idle-B-" + runId;
+        Map<String, String> topics = Map.of(
+                "A", "transaction-idle-A-" + runId,
+                "B", "transaction-idle-B-" + runId,
+                "C", "transaction-idle-C-" + runId);
+        Path marker = directory.resolve("restored-b-window-fired.txt");
+        String bootstrap = broker.getBrokersAsString();
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", bootstrap));
+             var producer = new KafkaProducer<String, String>(Map.of(
+                     ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap,
+                     ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.ACKS_CONFIG, "all"))) {
+            admin.createTopics(topics.values().stream().map(topic -> new NewTopic(topic, 1, (short) 1))
+                    .toList()).all().get(10, TimeUnit.SECONDS);
+            Process first = startCandidateProcess(topics, 30, "idle-before-halt", false);
+            try {
+                producer.send(new ProducerRecord<>(topics.get("B"), 0, "ST-BENCH",
+                        observed(bId, 0))).get(10, TimeUnit.SECONDS);
+                await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertThat(first.isAlive()).isTrue();
+                    assertThat(offset(admin, topics.get("B"), topics.get("B"))).isEqualTo(1);
+                    assertThat(countForTransaction("transaction_inbox_event", bId)).isEqualTo(1);
+                });
+            } finally {
+                first.destroyForcibly();
+                assertThat(first.waitFor(10, TimeUnit.SECONDS)).isTrue();
+            }
+            assertThat(first.exitValue()).isNotZero();
+
+            Process second = startCandidateProcess(topics, 30, "idle-after-halt", true,
+                    false, bId, marker);
+            try {
+                await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+                    assertThat(second.isAlive()).isTrue();
+                    assertThat(Files.exists(marker)).isTrue();
+                    assertThat(Files.readString(marker)).contains(bId);
+                });
+                assertThat(offset(admin, topics.get("B"), topics.get("B"))).isEqualTo(1);
+                assertThat(countForTransaction("transaction_inbox_event", bId)).isEqualTo(1);
+                assertThat(countForTransaction("transaction_session_candidate", bId)).isZero();
+            } finally {
+                second.destroyForcibly();
+                assertThat(second.waitFor(10, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
     private void verifyJvmTerminationAfterCommittedStart(boolean restoreFromInbox) throws Exception {
         String runId = UUID.randomUUID().toString();
         Map<String, String> topics = Map.of(
@@ -372,6 +534,20 @@ class TransactionRecoveryOnlinePerformanceTest {
 
     private Process startCandidateProcess(Map<String, String> topics, int windowSeconds,
                                           String phase, boolean restoreFromInbox) throws IOException {
+        return startCandidateProcess(topics, windowSeconds, phase, restoreFromInbox, false);
+    }
+
+    private Process startCandidateProcess(Map<String, String> topics, int windowSeconds,
+                                          String phase, boolean restoreFromInbox,
+                                          boolean pauseAfterStart) throws IOException {
+        return startCandidateProcess(topics, windowSeconds, phase, restoreFromInbox,
+                pauseAfterStart, "", null);
+    }
+
+    private Process startCandidateProcess(Map<String, String> topics, int windowSeconds,
+                                          String phase, boolean restoreFromInbox,
+                                          boolean pauseAfterStart, String bRestorePrefix,
+                                          Path windowMarker) throws IOException {
         var builder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java")
                 .toString(), "-cp", System.getProperty("transaction.test.runtime-classpath"),
                 TransactionCandidateRestartProcess.class.getName(),
@@ -383,6 +559,10 @@ class TransactionRecoveryOnlinePerformanceTest {
                 "--transaction.test.topic-c=" + topics.get("C"),
                 "--transaction.test.window-seconds=" + windowSeconds,
                 "--transaction.test.restore-from-inbox=" + restoreFromInbox,
+                "--transaction.test.pause-after-start=" + pauseAfterStart,
+                "--transaction.test.b-restore-prefix=" + bRestorePrefix,
+                "--transaction.test.window-marker-file=" +
+                        (windowMarker == null ? "" : windowMarker.toAbsolutePath()),
                 "--spring.kafka.consumer.properties[session.timeout.ms]=6000",
                 "--spring.kafka.consumer.properties[heartbeat.interval.ms]=1000");
         builder.environment().put("SPRING_DATASOURCE_URL", POSTGRES.getJdbcUrl("postgres", "postgres"));
@@ -678,6 +858,7 @@ class TransactionRecoveryOnlinePerformanceTest {
         private final TransactionTemplate transactions;
         private final JdbcClient jdbc;
         private final boolean restoreFromInbox;
+        private final Consumer<String> onWindowCompleted;
         private final Map<String, Boolean> started = new ConcurrentHashMap<>();
         private final Map<String, List<WindowEntry>> windows = new ConcurrentHashMap<>();
         private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
@@ -690,6 +871,14 @@ class TransactionRecoveryOnlinePerformanceTest {
         CandidateAdapter(String mode, int windowSeconds, JdbcTransactionInbox inbox,
                          TransactionRecoveryRules rules, TransactionTemplate transactions,
                          JdbcClient jdbc, boolean restoreFromInbox) {
+            this(mode, windowSeconds, inbox, rules, transactions, jdbc, restoreFromInbox,
+                    transactionId -> { });
+        }
+
+        CandidateAdapter(String mode, int windowSeconds, JdbcTransactionInbox inbox,
+                         TransactionRecoveryRules rules, TransactionTemplate transactions,
+                         JdbcClient jdbc, boolean restoreFromInbox,
+                         Consumer<String> onWindowCompleted) {
             this.mode = mode;
             this.windowSeconds = windowSeconds;
             this.inbox = inbox;
@@ -697,6 +886,43 @@ class TransactionRecoveryOnlinePerformanceTest {
             this.transactions = transactions;
             this.jdbc = jdbc;
             this.restoreFromInbox = restoreFromInbox;
+            this.onWindowCompleted = onWindowCompleted;
+        }
+
+        void restorePendingWindows(String transactionIdPrefix,
+                                   Map<String, Long> candidateNanos) {
+            if (!"B".equals(mode) || !restoreFromInbox || transactionIdPrefix.isBlank()) return;
+            // The prefix confines this test-only scan to this consumer's synthetic transactions.
+            List<ObservedTransactionRecord> pending = jdbc.sql("""
+                    SELECT DISTINCT ON (e.charging_station_id, e.transaction_id)
+                      e.first_event_id, e.charging_station_id, e.transaction_id,
+                      e.seq_no, e.event_type, e.occurred_at, e.first_received_at,
+                      e.source_document::text AS source_text, s.station_id
+                    FROM transaction_inbox_event e
+                    JOIN transaction_inbox_state s
+                      ON s.charging_station_id = e.charging_station_id
+                     AND s.transaction_id = e.transaction_id
+                    WHERE e.transaction_id LIKE :transactionPrefix
+                      AND e.first_received_at >= :cutoff
+                      AND NOT EXISTS (
+                        SELECT 1 FROM transaction_session_candidate c
+                        WHERE c.charging_station_id = e.charging_station_id
+                          AND c.transaction_id = e.transaction_id)
+                    ORDER BY e.charging_station_id, e.transaction_id,
+                             e.first_received_at DESC, e.seq_no DESC
+                    """)
+                    .param("transactionPrefix", transactionIdPrefix + "%")
+                    .param("cutoff", OffsetDateTime.ofInstant(Instant.now().minusSeconds(windowSeconds),
+                            java.time.ZoneOffset.UTC))
+                    .query((rs, row) -> new ObservedTransactionRecord(
+                            rs.getObject("first_event_id", UUID.class), rs.getString("station_id"),
+                            rs.getString("charging_station_id"), rs.getString("transaction_id"),
+                            rs.getInt("seq_no"), rs.getString("event_type"),
+                            rs.getObject("occurred_at", OffsetDateTime.class).toInstant(),
+                            rs.getObject("first_received_at", OffsetDateTime.class).toInstant(),
+                            rs.getString("source_text"), null))
+                    .list();
+            pending.forEach(event -> restoreWindow(event, candidateNanos));
         }
 
         void accept(ObservedTransactionRecord event, Map<String, Long> candidateNanos) {
@@ -827,6 +1053,7 @@ class TransactionRecoveryOnlinePerformanceTest {
                     if (created) candidateNanos.put(event.transactionId(), System.nanoTime());
                 }
             }
+            onWindowCompleted.accept(copy.getFirst().lookup().transactionId());
         }
 
         @Override public void close() {
