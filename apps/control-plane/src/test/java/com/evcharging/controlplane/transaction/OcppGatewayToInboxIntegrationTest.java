@@ -317,7 +317,7 @@ class OcppGatewayToInboxIntegrationTest {
 
             assertThat(runExp0004OutboxChild("relay", outputTopic, transactionId)).isZero();
             assertThat(exp0004Count("exp0004_outbox", transactionId, true)).isEqualTo(1);
-            var output = readExp0004Output(outputTopic, 1);
+            var output = readExp0004Output(outputTopic, 0);
             assertThat(output).hasSize(1);
             assertThat(output.getFirst().path("eventId").asText()).isEqualTo(jdbc.sql("""
                     SELECT event_id FROM exp0004_outbox WHERE transaction_id = :id
@@ -360,6 +360,8 @@ class OcppGatewayToInboxIntegrationTest {
 
     @Test
     void pinnedSapSimulatorTransactionDistinguishesSameAndChangedSourceReplays() throws Exception {
+        Assumptions.assumeTrue(!CLOSEOUT_WSS_TEST || PROVISIONAL_SAP_TEST,
+                "Pinned SAP HOLD expectation requires candidate calculation to be disabled");
         String simulatorDirectory = System.getenv("EVC_SAP_INBOX_SIMULATOR_DIR");
         Assumptions.assumeTrue(simulatorDirectory != null && Files.isDirectory(Path.of(simulatorDirectory)),
                 "Pinned SAP simulator is an optional, separately obtained E3 input");
