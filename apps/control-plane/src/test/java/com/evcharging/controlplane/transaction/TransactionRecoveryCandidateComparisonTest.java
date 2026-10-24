@@ -160,7 +160,7 @@ class TransactionRecoveryCandidateComparisonTest {
     }
 
     @Test
-    void lateConflictingEndIsHeldAfterExperimentalSessionWasAlreadyWritten() throws Exception {
+    void lateConflictingEndInvalidatesProvisionalCandidate() throws Exception {
         String transactionId = "late-conflict-" + UUID.randomUUID();
         String topic = "transaction-late-conflict-" + UUID.randomUUID();
         String groupId = "transaction-late-conflict-" + UUID.randomUUID();
@@ -202,7 +202,12 @@ class TransactionRecoveryCandidateComparisonTest {
                         SELECT status FROM transaction_inbox_state
                         WHERE charging_station_id = 'CS-COMPARE' AND transaction_id = :id
                         """).param("id", transactionId).query(String.class).single();
-                assertThat(rawStatus).isEqualTo("HOLD_AFTER_FINALIZATION");
+                assertThat(rawStatus).isEqualTo("HOLD_AFTER_PROVISIONAL");
+                String candidateStatus = jdbc.sql("""
+                        SELECT candidate_status FROM transaction_session_candidate
+                        WHERE charging_station_id = 'CS-COMPARE' AND transaction_id = :id
+                        """).param("id", transactionId).query(String.class).single();
+                assertThat(candidateStatus).isEqualTo("INVALIDATED");
                 int conflicts = jdbc.sql("""
                         SELECT count(*) FROM transaction_inbox_conflict
                         WHERE charging_station_id = 'CS-COMPARE' AND transaction_id = :id
