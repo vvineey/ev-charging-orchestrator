@@ -56,7 +56,7 @@ import static org.awaitility.Awaitility.await;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
         properties = {"transaction.ingress.enabled=true", "spring.kafka.listener.auto-startup=false",
-                "transaction.recovery.experimental-session-confirmation-enabled=true"})
+                "transaction.recovery.experimental-candidate-calculation-enabled=true"})
 @EmbeddedKafka(partitions = 1, topics = "transaction-performance-bootstrap",
         bootstrapServersProperty = "spring.kafka.bootstrap-servers",
         brokerProperties = "offsets.topic.num.partitions=1")
@@ -100,14 +100,14 @@ class TransactionRecoveryOnlinePerformanceTest {
 
     record TimingSample(String transactionId, String pattern, Double decisionMillis) { }
 
-    record ModeResult(String mode, int transactions, int normal, int reverse, int finalized,
+    record ModeResult(String mode, int transactions, int normal, int reverse, int candidateCount,
                       int wrongEnergy, int offsetLag, long elapsedMillis,
                       double producedRecordsPerSecond, double runRecordsPerSecond,
-                      double observedFinalizationsPerSecond,
+                      double observedCandidatesPerSecond,
                       Double p50Millis, Double p95Millis, Double p99Millis,
                       Double normalP50Millis, Double normalP95Millis, Double normalP99Millis,
                       Double reverseP50Millis, Double reverseP95Millis, Double reverseP99Millis,
-                      long sourceRows, long stateRows, long sessionRows, long sourceJsonBytes,
+                      long sourceRows, long stateRows, long candidateRows, long sourceJsonBytes,
                       List<TimingSample> samples) { }
 
     record Report(String scope, int windowSeconds, int transactionsPerMode, String javaVersion,
@@ -127,7 +127,7 @@ class TransactionRecoveryOnlinePerformanceTest {
                 if (WINDOW_SECONDS >= 60) {
                     assertThat(offset(bRun.admin, bRun.group, bRun.topic))
                             .isEqualTo(TRANSACTIONS_PER_MODE * 2);
-                    assertThat(bRun.finalizedNanos).isEmpty();
+                    assertThat(bRun.candidateNanos).isEmpty();
                     bPendingAtCommittedOffset = TRANSACTIONS_PER_MODE;
                 } else {
                     bPendingAtCommittedOffset = -1;
@@ -140,15 +140,15 @@ class TransactionRecoveryOnlinePerformanceTest {
         }
         results.sort(Comparator.comparing(ModeResult::mode));
         assertThat(results).extracting(ModeResult::mode).containsExactly("A", "B", "C");
-        assertThat(results.get(0).finalized()).isEqualTo(TRANSACTIONS_PER_MODE / 2);
-        assertThat(results.get(1).finalized()).isEqualTo(TRANSACTIONS_PER_MODE);
-        assertThat(results.get(2).finalized()).isEqualTo(TRANSACTIONS_PER_MODE);
+        assertThat(results.get(0).candidateCount()).isEqualTo(TRANSACTIONS_PER_MODE / 2);
+        assertThat(results.get(1).candidateCount()).isEqualTo(TRANSACTIONS_PER_MODE);
+        assertThat(results.get(2).candidateCount()).isEqualTo(TRANSACTIONS_PER_MODE);
         assertThat(results).allSatisfy(result -> {
             assertThat(result.wrongEnergy()).isZero();
             assertThat(result.offsetLag()).isZero();
             assertThat(result.sourceRows()).isEqualTo(TRANSACTIONS_PER_MODE * 2);
             assertThat(result.stateRows()).isEqualTo(TRANSACTIONS_PER_MODE);
-            assertThat(result.sessionRows()).isEqualTo(result.finalized());
+            assertThat(result.candidateRows()).isEqualTo(result.candidateCount());
         });
         assertThat(results.get(1).p50Millis())
                 .isGreaterThan(Math.max(0.0, WINDOW_SECONDS * 1000.0 - 10_000.0));
@@ -204,7 +204,7 @@ class TransactionRecoveryOnlinePerformanceTest {
                 });
                 for (String mode : List.of("A", "B", "C")) {
                     assertThat(countForTransaction("transaction_inbox_event", ids.get(mode))).isEqualTo(1);
-                    assertThat(countForTransaction("recovered_transaction_session", ids.get(mode))).isZero();
+                    assertThat(countForTransaction("transaction_session_candidate", ids.get(mode))).isZero();
                 }
             } finally {
                 first.destroyForcibly();
@@ -225,18 +225,18 @@ class TransactionRecoveryOnlinePerformanceTest {
                     }
                 });
                 await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
-                        assertThat(countForTransaction("recovered_transaction_session", ids.get("C")))
+                        assertThat(countForTransaction("transaction_session_candidate", ids.get("C")))
                                 .isEqualTo(1));
                 // B has received only Ended in this JVM. Let its new five-second window elapse.
                 Thread.sleep(7_000);
                 for (String mode : List.of("A", "B", "C")) {
                     assertThat(countForTransaction("transaction_inbox_event", ids.get(mode))).isEqualTo(2);
-                    assertThat(countForTransaction("recovered_transaction_session", ids.get(mode)))
+                    assertThat(countForTransaction("transaction_session_candidate", ids.get(mode)))
                             .as("candidate %s after JVM halt", mode)
                             .isEqualTo("C".equals(mode) ? 1 : 0);
                 }
                 assertThat(jdbc.sql("""
-                        SELECT energy_wh FROM recovered_transaction_session
+                        SELECT energy_wh FROM transaction_session_candidate
                         WHERE transaction_id = :id
                         """).param("id", ids.get("C")).query(Integer.class).single())
                         .isEqualTo(2500);
@@ -254,7 +254,7 @@ class TransactionRecoveryOnlinePerformanceTest {
                 TransactionCandidateRestartProcess.class.getName(),
                 "--spring.kafka.listener.auto-startup=false",
                 "--transaction.ingress.enabled=true",
-                "--transaction.recovery.experimental-session-confirmation-enabled=true",
+                "--transaction.recovery.experimental-candidate-calculation-enabled=true",
                 "--transaction.test.topic-a=" + topics.get("A"),
                 "--transaction.test.topic-b=" + topics.get("B"),
                 "--transaction.test.topic-c=" + topics.get("C"),
@@ -293,7 +293,7 @@ class TransactionRecoveryOnlinePerformanceTest {
                     await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
                             assertThat(offset(admin, group, topic)).isEqualTo(1));
                     assertThat(countForTransaction("transaction_inbox_event", transactionId)).isEqualTo(1);
-                    assertThat(countForTransaction("recovered_transaction_session", transactionId)).isZero();
+                    assertThat(countForTransaction("transaction_session_candidate", transactionId)).isZero();
                     if ("B".equals(mode)) assertThat(initial.windows).containsKey(transactionId);
                 } finally {
                     first.stop();
@@ -314,12 +314,12 @@ class TransactionRecoveryOnlinePerformanceTest {
                                 assertThat(restarted.windows).isEmpty());
                     }
                     assertThat(countForTransaction("transaction_inbox_event", transactionId)).isEqualTo(2);
-                    long sessions = countForTransaction("recovered_transaction_session", transactionId);
-                    assertThat(sessions).as("candidate %s after adapter restart", mode)
+                    long candidates = countForTransaction("transaction_session_candidate", transactionId);
+                    assertThat(candidates).as("candidate %s after adapter restart", mode)
                             .isEqualTo("C".equals(mode) ? 1 : 0);
                     if ("C".equals(mode)) {
                         assertThat(jdbc.sql("""
-                                SELECT energy_wh FROM recovered_transaction_session
+                                SELECT energy_wh FROM transaction_session_candidate
                                 WHERE transaction_id = :id
                                 """).param("id", transactionId).query(Integer.class).single())
                                 .isEqualTo(2500);
@@ -344,10 +344,10 @@ class TransactionRecoveryOnlinePerformanceTest {
         var container = factory.createContainer(topic);
         container.getContainerProperties().setGroupId(group);
         container.getContainerProperties().setPollTimeout(100);
-        Map<String, Long> finalizedNanos = new ConcurrentHashMap<>();
+        Map<String, Long> candidateNanos = new ConcurrentHashMap<>();
         container.getContainerProperties().setMessageListener((MessageListener<String, String>) record -> {
             if (adapter == null) productionListener.consume(record);
-            else adapter.accept(decoder.decode(record.key(), record.value()), finalizedNanos);
+            else adapter.accept(decoder.decode(record.key(), record.value()), candidateNanos);
         });
         return container;
     }
@@ -357,9 +357,9 @@ class TransactionRecoveryOnlinePerformanceTest {
                 .param("id", transactionId).query(Long.class).single();
     }
 
-    private ModeResult measure(String mode, CandidateAdapter adapter, int expectedFinalized) throws Exception {
+    private ModeResult measure(String mode, CandidateAdapter adapter, int expectedCandidates) throws Exception {
         try (CandidateAdapter closeable = adapter; Run run = start(mode, adapter)) {
-            return finish(run, adapter, expectedFinalized, Duration.ofSeconds(60));
+            return finish(run, adapter, expectedCandidates, Duration.ofSeconds(60));
         }
     }
 
@@ -378,7 +378,7 @@ class TransactionRecoveryOnlinePerformanceTest {
         container.getContainerProperties().setGroupId(group);
         container.getContainerProperties().setPollTimeout(100);
         Map<String, Long> firstSentNanos = new ConcurrentHashMap<>();
-        Map<String, Long> finalizedNanos = new ConcurrentHashMap<>();
+        Map<String, Long> candidateNanos = new ConcurrentHashMap<>();
         Set<UUID> lastEventIds = ConcurrentHashMap.newKeySet();
         AtomicInteger processed = new AtomicInteger();
         container.getContainerProperties().setMessageListener((MessageListener<String, String>) record -> {
@@ -387,10 +387,10 @@ class TransactionRecoveryOnlinePerformanceTest {
                 UUID eventId = UUID.fromString(mapper.readTree(record.value()).get("eventId").textValue());
                 if (lastEventIds.contains(eventId)) {
                     String id = mapper.readTree(record.value()).get("payload").get("transactionId").textValue();
-                    finalizedNanos.put(id, System.nanoTime());
+                    candidateNanos.put(id, System.nanoTime());
                 }
             } else {
-                adapter.accept(decoder.decode(record.key(), record.value()), finalizedNanos);
+                adapter.accept(decoder.decode(record.key(), record.value()), candidateNanos);
             }
             processed.incrementAndGet();
         });
@@ -412,44 +412,44 @@ class TransactionRecoveryOnlinePerformanceTest {
                     .get(10, TimeUnit.SECONDS);
         }
         return new Run(mode, topic, group, admin, producer, container, firstSentNanos,
-                finalizedNanos, processed, startNanos, System.nanoTime());
+                candidateNanos, processed, startNanos, System.nanoTime());
     }
 
-    private ModeResult finish(Run run, CandidateAdapter adapter, int expectedFinalized, Duration timeout)
+    private ModeResult finish(Run run, CandidateAdapter adapter, int expectedCandidates, Duration timeout)
             throws Exception {
         await().atMost(timeout).untilAsserted(() -> {
             assertThat(run.processed.get()).isEqualTo(TRANSACTIONS_PER_MODE * 2);
-            assertThat(run.finalizedNanos.size()).isEqualTo(expectedFinalized);
+            assertThat(run.candidateNanos.size()).isEqualTo(expectedCandidates);
             assertThat(offset(run.admin, run.group, run.topic)).isEqualTo(TRANSACTIONS_PER_MODE * 2);
         });
         long endNanos = System.nanoTime();
         long committed = offset(run.admin, run.group, run.topic);
         int lag = (int) (TRANSACTIONS_PER_MODE * 2 - committed);
-        int finalized = jdbc.sql("""
-                SELECT count(*) FROM recovered_transaction_session
+        int candidateCount = jdbc.sql("""
+                SELECT count(*) FROM transaction_session_candidate
                 WHERE transaction_id LIKE :prefix
                 """).param("prefix", "bench-" + run.mode + "-%").query(Long.class).single().intValue();
         int wrongEnergy = jdbc.sql("""
-                SELECT count(*) FROM recovered_transaction_session
+                SELECT count(*) FROM transaction_session_candidate
                 WHERE transaction_id LIKE :prefix AND energy_wh <> 2500
                 """).param("prefix", "bench-" + run.mode + "-%").query(Long.class).single().intValue();
-        Set<String> actualSessions = new HashSet<>(jdbc.sql("""
-                SELECT transaction_id FROM recovered_transaction_session
+        Set<String> actualCandidates = new HashSet<>(jdbc.sql("""
+                SELECT transaction_id FROM transaction_session_candidate
                 WHERE transaction_id LIKE :prefix
                 """).param("prefix", "bench-" + run.mode + "-%").query(String.class).list());
-        Set<String> expectedSessions = new HashSet<>();
+        Set<String> expectedCandidatesSet = new HashSet<>();
         for (int index = 0; index < TRANSACTIONS_PER_MODE; index++) {
             if (!"A".equals(run.mode) || index % 2 == 0) {
-                expectedSessions.add("bench-" + run.mode + "-" + index);
+                expectedCandidatesSet.add("bench-" + run.mode + "-" + index);
             }
         }
-        assertThat(actualSessions).isEqualTo(expectedSessions);
+        assertThat(actualCandidates).isEqualTo(expectedCandidatesSet);
         List<TimingSample> samples = new ArrayList<>();
         for (int index = 0; index < TRANSACTIONS_PER_MODE; index++) {
             String id = "bench-" + run.mode + "-" + index;
-            Long finalAt = run.finalizedNanos.get(id);
+            Long candidateAt = run.candidateNanos.get(id);
             samples.add(new TimingSample(id, index % 2 == 0 ? "NORMAL" : "REVERSE",
-                    finalAt == null ? null : (finalAt - run.firstSentNanos.get(id)) / 1_000_000.0));
+                    candidateAt == null ? null : (candidateAt - run.firstSentNanos.get(id)) / 1_000_000.0));
         }
         List<Double> milliseconds = samples.stream().map(TimingSample::decisionMillis)
                 .filter(java.util.Objects::nonNull).sorted().toList();
@@ -459,15 +459,15 @@ class TransactionRecoveryOnlinePerformanceTest {
                 .map(TimingSample::decisionMillis).filter(java.util.Objects::nonNull).sorted().toList();
         long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(endNanos - run.startNanos);
         return new ModeResult(run.mode, TRANSACTIONS_PER_MODE, TRANSACTIONS_PER_MODE / 2,
-                TRANSACTIONS_PER_MODE / 2, finalized, wrongEnergy, lag, elapsedMillis,
+                TRANSACTIONS_PER_MODE / 2, candidateCount, wrongEnergy, lag, elapsedMillis,
                 (TRANSACTIONS_PER_MODE * 2) / ((run.lastSendNanos - run.startNanos) / 1_000_000_000.0),
                 (TRANSACTIONS_PER_MODE * 2) / ((endNanos - run.startNanos) / 1_000_000_000.0),
-                finalized / ((endNanos - run.startNanos) / 1_000_000_000.0),
+                candidateCount / ((endNanos - run.startNanos) / 1_000_000_000.0),
                 percentile(milliseconds, .50), percentile(milliseconds, .95), percentile(milliseconds, .99),
                 percentile(normalMillis, .50), percentile(normalMillis, .95), percentile(normalMillis, .99),
                 percentile(reverseMillis, .50), percentile(reverseMillis, .95), percentile(reverseMillis, .99),
                 count("transaction_inbox_event", run.mode), count("transaction_inbox_state", run.mode),
-                count("recovered_transaction_session", run.mode),
+                count("transaction_session_candidate", run.mode),
                 jdbc.sql("""
                         SELECT coalesce(sum(pg_column_size(source_document)), 0)
                         FROM transaction_inbox_event WHERE transaction_id LIKE :prefix
@@ -547,8 +547,8 @@ class TransactionRecoveryOnlinePerformanceTest {
             this.transactions = transactions;
         }
 
-        void accept(ObservedTransactionRecord event, Map<String, Long> finalizedNanos) {
-            boolean finalized = Boolean.TRUE.equals(transactions.execute(status -> {
+        void accept(ObservedTransactionRecord event, Map<String, Long> candidateNanos) {
+            boolean created = Boolean.TRUE.equals(transactions.execute(status -> {
                 JdbcTransactionInbox.State state = inbox.ensureAndLock(event);
                 if (!state.stationId().equals(event.stationId())) return false;
                 if (!inbox.insertEvent(event)) {
@@ -561,13 +561,13 @@ class TransactionRecoveryOnlinePerformanceTest {
                 if ("A".equals(mode)) return applyArrival(event);
                 return false;
             }));
-            if (finalized) finalizedNanos.put(event.transactionId(), System.nanoTime());
+            if (created) candidateNanos.put(event.transactionId(), System.nanoTime());
             if ("B".equals(mode)) {
                 windows.compute(event.transactionId(), (id, existing) -> {
                     if (existing == null) {
                         List<ObservedTransactionRecord> batch = new ArrayList<>();
                         batch.add(event);
-                        scheduler.schedule(() -> flush(id, batch, finalizedNanos), windowSeconds,
+                        scheduler.schedule(() -> flush(id, batch, candidateNanos), windowSeconds,
                                 TimeUnit.SECONDS);
                         return batch;
                     }
@@ -587,17 +587,17 @@ class TransactionRecoveryOnlinePerformanceTest {
                 return false;
             }
             TransactionRecoveryRules.Outcome outcome = rules.evaluate(inbox.events(event));
-            if (!"FINALIZED".equals(outcome.status())) {
+            if (!"CALCULATED".equals(outcome.status())) {
                 inbox.updateState(event, "HOLD", outcome.reason(), null);
                 return false;
             }
-            inbox.insertSession(event, outcome);
-            inbox.updateState(event, "FINALIZED", null, outcome.evseId());
+            inbox.insertCandidate(event, outcome);
+            inbox.updateState(event, "PROVISIONAL", null, outcome.evseId());
             return true;
         }
 
         private void flush(String id, List<ObservedTransactionRecord> batch,
-                           Map<String, Long> finalizedNanos) {
+                           Map<String, Long> candidateNanos) {
             List<ObservedTransactionRecord> copy;
             synchronized (batch) { copy = new ArrayList<>(batch); }
             windows.remove(id, batch);
@@ -606,18 +606,18 @@ class TransactionRecoveryOnlinePerformanceTest {
             for (ObservedTransactionRecord event : copy) {
                 if ("Started".equals(event.eventType())) sawStart = true;
                 if ("Ended".equals(event.eventType()) && sawStart) {
-                    boolean finalized = Boolean.TRUE.equals(transactions.execute(status -> {
+                    boolean created = Boolean.TRUE.equals(transactions.execute(status -> {
                         inbox.ensureAndLock(event);
                         TransactionRecoveryRules.Outcome outcome = rules.evaluate(inbox.events(event));
-                        if (!"FINALIZED".equals(outcome.status())) {
+                        if (!"CALCULATED".equals(outcome.status())) {
                             inbox.updateState(event, "HOLD", outcome.reason(), null);
                             return false;
                         }
-                        inbox.insertSession(event, outcome);
-                        inbox.updateState(event, "FINALIZED", null, outcome.evseId());
+                        inbox.insertCandidate(event, outcome);
+                        inbox.updateState(event, "PROVISIONAL", null, outcome.evseId());
                         return true;
                     }));
-                    if (finalized) finalizedNanos.put(id, System.nanoTime());
+                    if (created) candidateNanos.put(id, System.nanoTime());
                 }
             }
         }
@@ -630,7 +630,7 @@ class TransactionRecoveryOnlinePerformanceTest {
     private record Run(String mode, String topic, String group, AdminClient admin,
                        KafkaProducer<String, String> producer,
                        org.springframework.kafka.listener.ConcurrentMessageListenerContainer<String, String> container,
-                       Map<String, Long> firstSentNanos, Map<String, Long> finalizedNanos,
+                       Map<String, Long> firstSentNanos, Map<String, Long> candidateNanos,
                        AtomicInteger processed, long startNanos, long lastSendNanos) implements AutoCloseable {
         @Override public void close() {
             container.stop();

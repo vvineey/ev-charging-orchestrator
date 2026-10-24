@@ -1,0 +1,31 @@
+{
+  "name": "exp0003-outbox-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "postgres",
+    "database.password": "exp0003_only",
+    "database.dbname": "exp0003",
+    "topic.prefix": "exp0003_source",
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "plugin.name": "pgoutput",
+    "slot.name": "exp0003_outbox_slot",
+    "slot.drop.on.stop": "false",
+    "publication.name": "exp0003_outbox_publication",
+    "publication.autocreate.mode": "filtered",
+    "table.include.list": "public.exp0003_outbox",
+    "snapshot.mode": "no_data",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.route.topic.replacement": "exp0003.outbox",
+    "transforms.outbox.table.field.event.id": "id",
+    "transforms.outbox.table.field.event.key": "aggregateid",
+    "transforms.outbox.table.field.event.payload": "payload",
+    "transforms.outbox.table.expand.json.payload": "true",
+    "transforms.outbox.table.op.invalid.behavior": "fatal"
+  }
+}

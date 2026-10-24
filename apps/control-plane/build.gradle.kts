@@ -38,4 +38,22 @@ tasks.test {
             layout.buildDirectory.file("experiment-results/exp-0002-online-performance.json").get().asFile.absolutePath)
     systemProperty("transaction.test.performance-enabled", project.findProperty("performanceEnabled")?.toString() ?: "false")
     systemProperty("transaction.test.window-seconds", project.findProperty("performanceWindowSeconds")?.toString() ?: "300")
+    systemProperty("exp0003.cdc.enabled", project.findProperty("exp0003Cdc")?.toString() ?: "false")
+    systemProperty("exp0003.cdc.compose-file",
+            rootProject.layout.projectDirectory.file("load-tests/outbox/compose.yaml").asFile.absolutePath)
+    systemProperty("exp0003.cdc.connector-file",
+            rootProject.layout.projectDirectory.file("load-tests/outbox/connector.json").asFile.absolutePath)
+    systemProperty("exp0003.burst.enabled", project.findProperty("exp0003Burst")?.toString() ?: "false")
+    systemProperty("exp0003.burst.mode", project.findProperty("exp0003BurstMode")?.toString() ?: "POLLING")
+    systemProperty("exp0003.burst.batch-size", project.findProperty("exp0003BurstBatchSize")?.toString() ?: "1")
+    systemProperty("exp0003.burst.events", project.findProperty("exp0003BurstEvents")?.toString() ?: "1000")
+    systemProperty("exp0003.burst.output", project.findProperty("exp0003BurstOutput")?.toString()
+            ?: layout.buildDirectory.file("experiment-results/exp0003-burst-result.json").get().asFile.absolutePath)
+    systemProperty("exp0003.steady.enabled", project.findProperty("exp0003Steady")?.toString() ?: "false")
+    systemProperty("exp0003.steady.mode", project.findProperty("exp0003SteadyMode")?.toString() ?: "POLLING")
+    systemProperty("exp0003.steady.rate", project.findProperty("exp0003SteadyRate")?.toString() ?: "200")
+    systemProperty("exp0003.steady.seconds", project.findProperty("exp0003SteadySeconds")?.toString() ?: "5")
+    systemProperty("exp0003.steady.cdc-poll-ms", project.findProperty("exp0003SteadyCdcPollMs")?.toString() ?: "default")
+    systemProperty("exp0003.steady.output", project.findProperty("exp0003SteadyOutput")?.toString()
+            ?: layout.buildDirectory.file("experiment-results/exp0003-steady-result.json").get().asFile.absolutePath)
 }

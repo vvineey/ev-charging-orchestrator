@@ -39,9 +39,9 @@ public final class TransactionCandidateRestartProcess {
             } else {
                 var adapter = new TransactionRecoveryOnlinePerformanceTest.CandidateAdapter(
                         mode, windowSeconds, inbox, rules, transactions);
-                Map<String, Long> finalizedNanos = new ConcurrentHashMap<>();
+                Map<String, Long> candidateNanos = new ConcurrentHashMap<>();
                 container.getContainerProperties().setMessageListener((MessageListener<String, String>)
-                        record -> adapter.accept(decoder.decode(record.key(), record.value()), finalizedNanos));
+                        record -> adapter.accept(decoder.decode(record.key(), record.value()), candidateNanos));
             }
             container.start();
         }

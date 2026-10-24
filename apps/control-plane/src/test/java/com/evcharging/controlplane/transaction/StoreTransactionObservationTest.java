@@ -21,7 +21,7 @@ class StoreTransactionObservationTest {
 
     @Test
     void liveIngressDoesNotConfirmEnergyBeforeMeterPolicyApproval() {
-        var result = new TransactionRecoveryRules.Outcome("FINALIZED", null, 1,
+        var result = new TransactionRecoveryRules.Outcome("CALCULATED", null, 1,
                 Instant.parse("2026-01-01T10:00:00Z"), Instant.parse("2026-01-01T10:20:00Z"),
                 new BigDecimal("2500"));
         when(inbox.ensureAndLock(event)).thenReturn(new JdbcTransactionInbox.State("ST-TEST", "PENDING"));
@@ -31,12 +31,12 @@ class StoreTransactionObservationTest {
 
         new StoreTransactionObservation(inbox, rules, false).store(event);
         verify(inbox).updateState(event, "HOLD", "METER_POLICY_PENDING", 1);
-        verify(inbox, never()).insertSession(event, result);
+        verify(inbox, never()).insertCandidate(event, result);
     }
 
     @Test
-    void experimentalFixtureCanConfirmOneSession() {
-        var result = new TransactionRecoveryRules.Outcome("FINALIZED", null, 1,
+    void experimentalFixtureCanStoreOneProvisionalCandidate() {
+        var result = new TransactionRecoveryRules.Outcome("CALCULATED", null, 1,
                 Instant.parse("2026-01-01T10:00:00Z"), Instant.parse("2026-01-01T10:20:00Z"),
                 new BigDecimal("2500"));
         when(inbox.ensureAndLock(event)).thenReturn(new JdbcTransactionInbox.State("ST-TEST", "PENDING"));
@@ -45,36 +45,38 @@ class StoreTransactionObservationTest {
         when(rules.evaluate(List.of())).thenReturn(result);
 
         new StoreTransactionObservation(inbox, rules, true).store(event);
-        verify(inbox).insertSession(event, result);
-        verify(inbox).updateState(event, "FINALIZED", null, 1);
+        verify(inbox).insertCandidate(event, result);
+        verify(inbox).updateState(event, "PROVISIONAL", null, 1);
     }
 
     @Test
-    void conflictAfterConfirmationBlocksFurtherAutomaticProgress() {
-        when(inbox.ensureAndLock(event)).thenReturn(new JdbcTransactionInbox.State("ST-TEST", "FINALIZED"));
+    void conflictAfterProvisionalCalculationInvalidatesCandidate() {
+        when(inbox.ensureAndLock(event)).thenReturn(new JdbcTransactionInbox.State("ST-TEST", "PROVISIONAL"));
         when(inbox.insertEvent(event)).thenReturn(false);
         when(inbox.sameSource(event)).thenReturn(false);
 
         new StoreTransactionObservation(inbox, rules, true).store(event);
         verify(inbox).preserveConflict(event);
-        verify(inbox).updateState(event, "HOLD_AFTER_FINALIZATION", "SOURCE_CONFLICT", null);
-        verify(inbox, never()).insertSession(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+        verify(inbox).invalidateCandidate(event, "SOURCE_CONFLICT");
+        verify(inbox).updateState(event, "HOLD_AFTER_PROVISIONAL", "SOURCE_CONFLICT", null);
+        verify(inbox, never()).insertCandidate(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
     }
 
     @Test
-    void lateNewEventAfterConfirmationIsHeldForReview() {
-        when(inbox.ensureAndLock(event)).thenReturn(new JdbcTransactionInbox.State("ST-TEST", "FINALIZED"));
+    void lateNewEventAfterProvisionalCalculationIsHeldForReview() {
+        when(inbox.ensureAndLock(event)).thenReturn(new JdbcTransactionInbox.State("ST-TEST", "PROVISIONAL"));
         when(inbox.insertEvent(event)).thenReturn(true);
         when(inbox.events(event)).thenReturn(List.of());
         when(rules.evaluate(List.of())).thenReturn(TransactionRecoveryRules.Outcome.hold("INVALID_SEQUENCE"));
 
         new StoreTransactionObservation(inbox, rules, true).store(event);
-        verify(inbox).updateState(event, "HOLD_AFTER_FINALIZATION", "LATE_INVALID_EVENT", null);
+        verify(inbox).invalidateCandidate(event, "LATE_INVALID_EVENT");
+        verify(inbox).updateState(event, "HOLD_AFTER_PROVISIONAL", "LATE_INVALID_EVENT", null);
     }
 
     @Test
     void exactReplayCanReevaluateHeldFixtureAfterPolicyChange() {
-        var result = new TransactionRecoveryRules.Outcome("FINALIZED", null, 1,
+        var result = new TransactionRecoveryRules.Outcome("CALCULATED", null, 1,
                 Instant.parse("2026-01-01T10:00:00Z"), Instant.parse("2026-01-01T10:20:00Z"),
                 new BigDecimal("2500"));
         when(inbox.ensureAndLock(event)).thenReturn(new JdbcTransactionInbox.State("ST-TEST", "HOLD"));
@@ -84,6 +86,6 @@ class StoreTransactionObservationTest {
         when(rules.evaluate(List.of())).thenReturn(result);
 
         new StoreTransactionObservation(inbox, rules, true).store(event);
-        verify(inbox).insertSession(event, result);
+        verify(inbox).insertCandidate(event, result);
     }
 }
