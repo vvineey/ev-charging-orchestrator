@@ -12,6 +12,7 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -95,6 +96,7 @@ class TransactionRecoveryOnlinePerformanceTest {
     @Autowired TransactionTemplate transactions;
     @Autowired @Qualifier("transactionKafkaListenerContainerFactory")
     ConcurrentKafkaListenerContainerFactory<String, String> factory;
+    @TempDir Path directory;
 
     record TimingSample(String transactionId, String pattern, Double decisionMillis) { }
 
@@ -117,10 +119,10 @@ class TransactionRecoveryOnlinePerformanceTest {
         List<ModeResult> results = new ArrayList<>();
         int bPendingAtCommittedOffset;
         // B runs first so its real timer can elapse while A and C are measured.
-        try (CandidateAdapter b = new CandidateAdapter("B", WINDOW_SECONDS)) {
+        try (CandidateAdapter b = adapter("B", WINDOW_SECONDS)) {
             Run bRun = start("B", b);
             try {
-                results.add(measure("A", new CandidateAdapter("A", 0), TRANSACTIONS_PER_MODE / 2));
+                results.add(measure("A", adapter("A", 0), TRANSACTIONS_PER_MODE / 2));
                 results.add(measure("C", null, 120));
                 if (WINDOW_SECONDS >= 60) {
                     assertThat(offset(bRun.admin, bRun.group, bRun.topic))
@@ -165,6 +167,106 @@ class TransactionRecoveryOnlinePerformanceTest {
         for (String mode : List.of("A", "B", "C")) {
             verifyCommittedStartAcrossConsumerRestart(mode);
         }
+    }
+
+    @Test
+    void actualJvmTerminationAfterCommittedStartPreservesOnlyDurableCandidateProgress()
+            throws Exception {
+        String runId = UUID.randomUUID().toString();
+        Map<String, String> topics = Map.of(
+                "A", "transaction-jvm-A-" + runId,
+                "B", "transaction-jvm-B-" + runId,
+                "C", "transaction-jvm-C-" + runId);
+        Map<String, String> ids = Map.of(
+                "A", "jvm-restart-A-" + runId,
+                "B", "jvm-restart-B-" + runId,
+                "C", "jvm-restart-C-" + runId);
+        String bootstrap = broker.getBrokersAsString();
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", bootstrap));
+             var producer = new KafkaProducer<String, String>(Map.of(
+                     ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap,
+                     ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.ACKS_CONFIG, "all"))) {
+            admin.createTopics(topics.values().stream().map(topic -> new NewTopic(topic, 1, (short) 1))
+                    .toList()).all().get(10, TimeUnit.SECONDS);
+            Process first = startCandidateProcess(topics, 30, "before-halt");
+            try {
+                for (String mode : List.of("A", "B", "C")) {
+                    producer.send(new ProducerRecord<>(topics.get(mode), 0, "ST-BENCH",
+                            observed(ids.get(mode), 0))).get(10, TimeUnit.SECONDS);
+                }
+                await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertThat(first.isAlive()).isTrue();
+                    for (String mode : List.of("A", "B", "C")) {
+                        assertThat(offset(admin, topics.get(mode), topics.get(mode))).isEqualTo(1);
+                    }
+                });
+                for (String mode : List.of("A", "B", "C")) {
+                    assertThat(countForTransaction("transaction_inbox_event", ids.get(mode))).isEqualTo(1);
+                    assertThat(countForTransaction("recovered_transaction_session", ids.get(mode))).isZero();
+                }
+            } finally {
+                first.destroyForcibly();
+                assertThat(first.waitFor(10, TimeUnit.SECONDS)).isTrue();
+            }
+            assertThat(first.exitValue()).isNotZero();
+
+            Process second = startCandidateProcess(topics, 5, "after-halt");
+            try {
+                for (String mode : List.of("A", "B", "C")) {
+                    producer.send(new ProducerRecord<>(topics.get(mode), 0, "ST-BENCH",
+                            observed(ids.get(mode), 1))).get(10, TimeUnit.SECONDS);
+                }
+                await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertThat(second.isAlive()).isTrue();
+                    for (String mode : List.of("A", "B", "C")) {
+                        assertThat(offset(admin, topics.get(mode), topics.get(mode))).isEqualTo(2);
+                    }
+                });
+                await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
+                        assertThat(countForTransaction("recovered_transaction_session", ids.get("C")))
+                                .isEqualTo(1));
+                // B has received only Ended in this JVM. Let its new five-second window elapse.
+                Thread.sleep(7_000);
+                for (String mode : List.of("A", "B", "C")) {
+                    assertThat(countForTransaction("transaction_inbox_event", ids.get(mode))).isEqualTo(2);
+                    assertThat(countForTransaction("recovered_transaction_session", ids.get(mode)))
+                            .as("candidate %s after JVM halt", mode)
+                            .isEqualTo("C".equals(mode) ? 1 : 0);
+                }
+                assertThat(jdbc.sql("""
+                        SELECT energy_wh FROM recovered_transaction_session
+                        WHERE transaction_id = :id
+                        """).param("id", ids.get("C")).query(Integer.class).single())
+                        .isEqualTo(2500);
+            } finally {
+                second.destroyForcibly();
+                assertThat(second.waitFor(10, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
+    private Process startCandidateProcess(Map<String, String> topics, int windowSeconds,
+                                          String phase) throws IOException {
+        var builder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java")
+                .toString(), "-cp", System.getProperty("transaction.test.runtime-classpath"),
+                TransactionCandidateRestartProcess.class.getName(),
+                "--spring.kafka.listener.auto-startup=false",
+                "--transaction.ingress.enabled=true",
+                "--transaction.recovery.experimental-session-confirmation-enabled=true",
+                "--transaction.test.topic-a=" + topics.get("A"),
+                "--transaction.test.topic-b=" + topics.get("B"),
+                "--transaction.test.topic-c=" + topics.get("C"),
+                "--transaction.test.window-seconds=" + windowSeconds,
+                "--spring.kafka.consumer.properties[session.timeout.ms]=6000",
+                "--spring.kafka.consumer.properties[heartbeat.interval.ms]=1000");
+        builder.environment().put("SPRING_DATASOURCE_URL", POSTGRES.getJdbcUrl("postgres", "postgres"));
+        builder.environment().put("SPRING_DATASOURCE_USERNAME", "postgres");
+        builder.environment().put("SPRING_DATASOURCE_PASSWORD", "postgres");
+        builder.environment().put("SPRING_KAFKA_BOOTSTRAPSERVERS", broker.getBrokersAsString());
+        builder.redirectErrorStream(true).redirectOutput(directory.resolve(phase + ".log").toFile());
+        return builder.start();
     }
 
     private void verifyCommittedStartAcrossConsumerRestart(String mode) throws Exception {
@@ -230,7 +332,11 @@ class TransactionRecoveryOnlinePerformanceTest {
     }
 
     private CandidateAdapter adapterForRestart(String mode) {
-        return "C".equals(mode) ? null : new CandidateAdapter(mode, 5);
+        return "C".equals(mode) ? null : adapter(mode, 5);
+    }
+
+    private CandidateAdapter adapter(String mode, int windowSeconds) {
+        return new CandidateAdapter(mode, windowSeconds, inbox, rules, transactions);
     }
 
     private ConcurrentMessageListenerContainer<String, String> restartContainer(
@@ -422,16 +528,23 @@ class TransactionRecoveryOnlinePerformanceTest {
         return mapper.writeValueAsString(root);
     }
 
-    private final class CandidateAdapter implements AutoCloseable {
+    static final class CandidateAdapter implements AutoCloseable {
         private final String mode;
         private final int windowSeconds;
+        private final JdbcTransactionInbox inbox;
+        private final TransactionRecoveryRules rules;
+        private final TransactionTemplate transactions;
         private final Map<String, Boolean> started = new ConcurrentHashMap<>();
         private final Map<String, List<ObservedTransactionRecord>> windows = new ConcurrentHashMap<>();
         private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
-        CandidateAdapter(String mode, int windowSeconds) {
+        CandidateAdapter(String mode, int windowSeconds, JdbcTransactionInbox inbox,
+                         TransactionRecoveryRules rules, TransactionTemplate transactions) {
             this.mode = mode;
             this.windowSeconds = windowSeconds;
+            this.inbox = inbox;
+            this.rules = rules;
+            this.transactions = transactions;
         }
 
         void accept(ObservedTransactionRecord event, Map<String, Long> finalizedNanos) {
