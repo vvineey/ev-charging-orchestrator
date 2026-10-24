@@ -31,6 +31,7 @@ import tools.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -49,6 +50,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 
@@ -125,12 +127,17 @@ class TransactionRecoveryOnlinePerformanceTest {
     record DatabaseActivity(long blocksRead, long blocksHit, long tuplesReturned,
                             long tuplesFetched, long tuplesInserted, long tuplesUpdated) { }
 
+    record DatabaseIo(long reads, long writes, long fsyncs, long hits) { }
+
     record IsolatedReport(String scope, String mode, String run, int requestedRecordsPerSecond,
                           int windowSeconds, boolean restoreFromInbox, String javaVersion, String osName,
-                          String databaseVersion, long processCpuNanos,
+                          String databaseVersion, long processCpuNanos, Long postgresCpuNanos,
+                          Long jvmSampledPeakRssBytes, Long postgresSampledPeakSummedRssBytes,
+                          int postgresSampledPeakProcessCount,
                           long heapUsedBeforeBytes, long heapUsedAfterBytes,
                           TableBytes before, TableBytes after,
                           DatabaseActivity databaseBefore, DatabaseActivity databaseAfter,
+                          DatabaseIo ioBefore, DatabaseIo ioAfter,
                           ModeResult result) { }
 
     @Test
@@ -143,22 +150,38 @@ class TransactionRecoveryOnlinePerformanceTest {
         assertThat(requestedRate).isPositive();
         TableBytes before = tableBytes();
         DatabaseActivity databaseBefore = databaseActivity();
+        DatabaseIo ioBefore = databaseIo();
         long heapBefore = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
         var operatingSystem = (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
         long cpuBefore = operatingSystem.getProcessCpuTime();
         int expectedCandidates = "A".equals(mode) ? TRANSACTIONS_PER_MODE / 2 : TRANSACTIONS_PER_MODE;
         ModeResult result;
-        try (CandidateAdapter candidate = "C".equals(mode) ? null
+        try (ProcessSampler processes = new ProcessSampler(
+                jdbc.sql("SELECT pg_backend_pid()").query(Integer.class).single());
+             CandidateAdapter candidate = "C".equals(mode) ? null
                 : new CandidateAdapter(mode, WINDOW_SECONDS, inbox, rules, transactions,
                         jdbc, restoreFromInbox);
              Run started = start(mode, candidate, requestedRate)) {
             result = finish(started, candidate, expectedCandidates,
                     Duration.ofSeconds(WINDOW_SECONDS + 60));
+            writeIsolatedReport(mode, runLabel, requestedRate, restoreFromInbox, before,
+                    databaseBefore, ioBefore, heapBefore, cpuBefore, operatingSystem,
+                    processes, result);
         }
+    }
+
+    private void writeIsolatedReport(String mode, String runLabel, int requestedRate,
+                                      boolean restoreFromInbox, TableBytes before,
+                                      DatabaseActivity databaseBefore, DatabaseIo ioBefore,
+                                      long heapBefore, long cpuBefore,
+                                      OperatingSystemMXBean operatingSystem,
+                                      ProcessSampler processes, ModeResult result) throws IOException {
         long cpuNanos = operatingSystem.getProcessCpuTime() - cpuBefore;
         long heapAfter = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
         TableBytes after = tableBytes();
         DatabaseActivity databaseAfter = databaseActivity();
+        DatabaseIo ioAfter = databaseIo();
+        processes.sample();
         Path output = Path.of(System.getProperty("transaction.test.isolated-output-dir"),
                 "exp-0002-isolated-" + mode + (restoreFromInbox ? "-restored-" : "-baseline-")
                         + runLabel + ".json");
@@ -167,8 +190,10 @@ class TransactionRecoveryOnlinePerformanceTest {
                 "single-candidate-embedded-resource-pilot-not-final-e5", mode, runLabel,
                 requestedRate, WINDOW_SECONDS, restoreFromInbox, System.getProperty("java.version"),
                 System.getProperty("os.name"), jdbc.sql("SELECT version()").query(String.class).single(),
-                cpuNanos, heapBefore, heapAfter, before, after,
-                databaseBefore, databaseAfter, result)));
+                cpuNanos, processes.postgresCpuNanos(), processes.jvmPeakRssBytes(),
+                processes.postgresPeakRssBytes(), processes.postgresPeakProcessCount(),
+                heapBefore, heapAfter, before, after,
+                databaseBefore, databaseAfter, ioBefore, ioAfter, result)));
     }
 
     private TableBytes tableBytes() {
@@ -186,6 +211,122 @@ class TransactionRecoveryOnlinePerformanceTest {
                 rs.getLong("blks_read"), rs.getLong("blks_hit"),
                 rs.getLong("tup_returned"), rs.getLong("tup_fetched"),
                 rs.getLong("tup_inserted"), rs.getLong("tup_updated"))).single();
+    }
+
+    private DatabaseIo databaseIo() {
+        return jdbc.sql("""
+                SELECT COALESCE(SUM(reads), 0) AS reads, COALESCE(SUM(writes), 0) AS writes,
+                       COALESCE(SUM(fsyncs), 0) AS fsyncs, COALESCE(SUM(hits), 0) AS hits
+                FROM pg_stat_io
+                """).query((rs, row) -> new DatabaseIo(
+                rs.getLong("reads"), rs.getLong("writes"),
+                rs.getLong("fsyncs"), rs.getLong("hits"))).single();
+    }
+
+    private static final class ProcessSampler implements AutoCloseable {
+        private final ProcessHandle postgres;
+        private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        private final Map<Long, Long> firstCpu = new ConcurrentHashMap<>();
+        private final Map<Long, Long> lastCpu = new ConcurrentHashMap<>();
+        private final AtomicLong jvmPeakRss = new AtomicLong(-1);
+        private final AtomicLong postgresPeakRss = new AtomicLong(-1);
+        private final AtomicInteger postgresPeakProcessCount = new AtomicInteger();
+
+        ProcessSampler(int backendPid) {
+            postgres = ProcessHandle.of(backendPid).flatMap(ProcessHandle::parent)
+                    .orElseThrow(() -> new IllegalStateException("PostgreSQL postmaster not found"));
+            assertThat(postgres.info().command().orElse("")).contains("postgres");
+            sample(true);
+            scheduler.scheduleAtFixedRate(this::sample, 1, 1, TimeUnit.SECONDS);
+        }
+
+        synchronized void sample() {
+            sample(false);
+        }
+
+        private synchronized void sample(boolean baseline) {
+            List<ProcessHandle> pg = postgresProcesses();
+            postgresPeakProcessCount.accumulateAndGet(pg.size(), Math::max);
+            List<Long> pids = new ArrayList<>(pg.stream().map(ProcessHandle::pid).toList());
+            pids.add(ProcessHandle.current().pid());
+            try {
+                Process ps = new ProcessBuilder("ps", "-o", "pid=,rss=,time=", "-p",
+                        pids.stream().map(String::valueOf).reduce((left, right) -> left + "," + right)
+                                .orElseThrow()).start();
+                String output = new String(ps.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+                if (ps.waitFor() != 0) return;
+                long postgresRss = 0;
+                for (String line : output.split("\\R")) {
+                    String[] columns = line.trim().split("\\s+");
+                    if (columns.length != 3) continue;
+                    long pid = Long.parseLong(columns[0]);
+                    long rss = Long.parseLong(columns[1]) * 1024;
+                    if (pid == ProcessHandle.current().pid()) {
+                        jvmPeakRss.accumulateAndGet(rss, Math::max);
+                    } else {
+                        postgresRss += rss;
+                        long cpuNanos = processCpuNanos(columns[2]);
+                        if (baseline) firstCpu.put(pid, cpuNanos);
+                        lastCpu.put(pid, cpuNanos);
+                    }
+                }
+                postgresPeakRss.accumulateAndGet(postgresRss, Math::max);
+            } catch (IOException exception) {
+                // A non-Unix host can still run the experiment without sampled RSS.
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        private long processCpuNanos(String time) {
+            String[] daysAndTime = time.split("-", 2);
+            long days = daysAndTime.length == 2 ? Long.parseLong(daysAndTime[0]) : 0;
+            String[] components = daysAndTime[daysAndTime.length - 1].split(":");
+            double seconds = 0;
+            for (String component : components) {
+                seconds = seconds * 60 + Double.parseDouble(component);
+            }
+            return Math.round((seconds + days * 86_400.0) * 1_000_000_000);
+        }
+
+        private List<ProcessHandle> postgresProcesses() {
+            try (var descendants = postgres.descendants()) {
+                List<ProcessHandle> result = new ArrayList<>();
+                result.add(postgres);
+                result.addAll(descendants.toList());
+                return result;
+            }
+        }
+
+        // ps TIME is cumulative per process; retain the last sample when a child exits.
+        Long postgresCpuNanos() {
+            if (lastCpu.isEmpty()) return null;
+            return lastCpu.entrySet().stream().mapToLong(entry ->
+                    Math.max(0, entry.getValue() - firstCpu.getOrDefault(entry.getKey(), 0L)))
+                    .sum();
+        }
+
+        Long jvmPeakRssBytes() {
+            return jvmPeakRss.get() < 0 ? null : jvmPeakRss.get();
+        }
+
+        Long postgresPeakRssBytes() {
+            return postgresPeakRss.get() < 0 ? null : postgresPeakRss.get();
+        }
+
+        int postgresPeakProcessCount() {
+            return postgresPeakProcessCount.get();
+        }
+
+        @Override
+        public void close() {
+            scheduler.shutdownNow();
+            try {
+                scheduler.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private long relationBytes(String table) {
