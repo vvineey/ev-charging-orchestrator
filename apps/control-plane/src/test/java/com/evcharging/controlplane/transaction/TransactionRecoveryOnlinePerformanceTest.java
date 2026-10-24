@@ -17,6 +17,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 import org.springframework.kafka.listener.MessageListener;
 import org.springframework.kafka.test.EmbeddedKafkaBroker;
 import org.springframework.kafka.test.context.EmbeddedKafka;
@@ -157,6 +158,97 @@ class TransactionRecoveryOnlinePerformanceTest {
                 System.getProperty("os.name"),
                 jdbc.sql("SELECT version()").query(String.class).single(),
                 bPendingAtCommittedOffset, results)));
+    }
+
+    @Test
+    void committedStartThenConsumerRestartExposesVolatileCandidateState() throws Exception {
+        for (String mode : List.of("A", "B", "C")) {
+            verifyCommittedStartAcrossConsumerRestart(mode);
+        }
+    }
+
+    private void verifyCommittedStartAcrossConsumerRestart(String mode) throws Exception {
+        String transactionId = "restart-" + mode + "-" + UUID.randomUUID();
+        String topic = "transaction-restart-" + mode + "-" + UUID.randomUUID();
+        String group = topic;
+        String bootstrap = broker.getBrokersAsString();
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", bootstrap));
+             var producer = new KafkaProducer<String, String>(Map.of(
+                     ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap,
+                     ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                     ProducerConfig.ACKS_CONFIG, "all"))) {
+            admin.createTopics(List.of(new NewTopic(topic, 1, (short) 1)))
+                    .all().get(10, TimeUnit.SECONDS);
+
+            // The first record is durably stored and its Kafka offset is committed before restart.
+            try (CandidateAdapter initial = adapterForRestart(mode)) {
+                var first = restartContainer(topic, group, initial);
+                try {
+                    first.start();
+                    producer.send(new ProducerRecord<>(topic, 0, "ST-BENCH",
+                            observed(transactionId, 0))).get(10, TimeUnit.SECONDS);
+                    await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
+                            assertThat(offset(admin, group, topic)).isEqualTo(1));
+                    assertThat(countForTransaction("transaction_inbox_event", transactionId)).isEqualTo(1);
+                    assertThat(countForTransaction("recovered_transaction_session", transactionId)).isZero();
+                    if ("B".equals(mode)) assertThat(initial.windows).containsKey(transactionId);
+                } finally {
+                    first.stop();
+                }
+            }
+
+            // A new adapter has no Started flag or scheduled B timer; C rereads the stored source.
+            try (CandidateAdapter restarted = adapterForRestart(mode)) {
+                var second = restartContainer(topic, group, restarted);
+                try {
+                    second.start();
+                    producer.send(new ProducerRecord<>(topic, 0, "ST-BENCH",
+                            observed(transactionId, 1))).get(10, TimeUnit.SECONDS);
+                    await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
+                            assertThat(offset(admin, group, topic)).isEqualTo(2));
+                    if ("B".equals(mode)) {
+                        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                                assertThat(restarted.windows).isEmpty());
+                    }
+                    assertThat(countForTransaction("transaction_inbox_event", transactionId)).isEqualTo(2);
+                    long sessions = countForTransaction("recovered_transaction_session", transactionId);
+                    assertThat(sessions).as("candidate %s after adapter restart", mode)
+                            .isEqualTo("C".equals(mode) ? 1 : 0);
+                    if ("C".equals(mode)) {
+                        assertThat(jdbc.sql("""
+                                SELECT energy_wh FROM recovered_transaction_session
+                                WHERE transaction_id = :id
+                                """).param("id", transactionId).query(Integer.class).single())
+                                .isEqualTo(2500);
+                    }
+                } finally {
+                    second.stop();
+                }
+            }
+        }
+    }
+
+    private CandidateAdapter adapterForRestart(String mode) {
+        return "C".equals(mode) ? null : new CandidateAdapter(mode, 5);
+    }
+
+    private ConcurrentMessageListenerContainer<String, String> restartContainer(
+            String topic, String group, CandidateAdapter adapter) {
+        var container = factory.createContainer(topic);
+        container.getContainerProperties().setGroupId(group);
+        container.getContainerProperties().setPollTimeout(100);
+        Map<String, Long> finalizedNanos = new ConcurrentHashMap<>();
+        container.getContainerProperties().setMessageListener((MessageListener<String, String>) record -> {
+            if (adapter == null) productionListener.consume(record);
+            else adapter.accept(decoder.decode(record.key(), record.value()), finalizedNanos);
+        });
+        return container;
+    }
+
+    private long countForTransaction(String table, String transactionId) {
+        return jdbc.sql("SELECT count(*) FROM " + table + " WHERE transaction_id = :id")
+                .param("id", transactionId).query(Long.class).single();
     }
 
     private ModeResult measure(String mode, CandidateAdapter adapter, int expectedFinalized) throws Exception {
