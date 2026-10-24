@@ -1,5 +1,6 @@
 package com.evcharging.controlplane.transaction;
 
+import com.sun.management.OperatingSystemMXBean;
 import io.zonky.test.db.postgres.embedded.EmbeddedPostgres;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.NewTopic;
@@ -29,6 +30,7 @@ import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -45,6 +47,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -113,6 +116,56 @@ class TransactionRecoveryOnlinePerformanceTest {
     record Report(String scope, int windowSeconds, int transactionsPerMode, String javaVersion,
                   String osName, String databaseVersion, int bPendingAtCommittedOffset,
                   List<ModeResult> results) { }
+
+    record TableBytes(long source, long state, long candidate) { }
+
+    record IsolatedReport(String scope, String mode, String run, int requestedRecordsPerSecond,
+                          int windowSeconds, String javaVersion, String osName,
+                          String databaseVersion, long processCpuNanos,
+                          long heapUsedBeforeBytes, long heapUsedAfterBytes,
+                          TableBytes before, TableBytes after, ModeResult result) { }
+
+    @Test
+    @EnabledIfSystemProperty(named = "transaction.test.isolated-mode", matches = "A|B|C")
+    void isolatedCandidateResourcePilot() throws Exception {
+        String mode = System.getProperty("transaction.test.isolated-mode");
+        String runLabel = System.getProperty("transaction.test.isolated-run");
+        int requestedRate = Integer.parseInt(System.getProperty("transaction.test.isolated-rate"));
+        assertThat(requestedRate).isPositive();
+        TableBytes before = tableBytes();
+        long heapBefore = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
+        var operatingSystem = (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+        long cpuBefore = operatingSystem.getProcessCpuTime();
+        int expectedCandidates = "A".equals(mode) ? TRANSACTIONS_PER_MODE / 2 : TRANSACTIONS_PER_MODE;
+        ModeResult result;
+        try (CandidateAdapter candidate = "C".equals(mode) ? null : adapter(mode, WINDOW_SECONDS);
+             Run started = start(mode, candidate, requestedRate)) {
+            result = finish(started, candidate, expectedCandidates,
+                    Duration.ofSeconds(WINDOW_SECONDS + 60));
+        }
+        long cpuNanos = operatingSystem.getProcessCpuTime() - cpuBefore;
+        long heapAfter = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
+        TableBytes after = tableBytes();
+        Path output = Path.of(System.getProperty("transaction.test.isolated-output-dir"),
+                "exp-0002-isolated-" + mode + "-" + runLabel + ".json");
+        Files.createDirectories(output.getParent());
+        Files.writeString(output, mapper.writeValueAsString(new IsolatedReport(
+                "single-candidate-embedded-resource-pilot-not-final-e5", mode, runLabel,
+                requestedRate, WINDOW_SECONDS, System.getProperty("java.version"),
+                System.getProperty("os.name"), jdbc.sql("SELECT version()").query(String.class).single(),
+                cpuNanos, heapBefore, heapAfter, before, after, result)));
+    }
+
+    private TableBytes tableBytes() {
+        return new TableBytes(relationBytes("transaction_inbox_event"),
+                relationBytes("transaction_inbox_state"),
+                relationBytes("transaction_session_candidate"));
+    }
+
+    private long relationBytes(String table) {
+        return jdbc.sql("SELECT pg_total_relation_size(CAST(:tableName AS regclass))")
+                .param("tableName", table).query(Long.class).single();
+    }
 
     @Test
     void sameKafkaPostgresBoundaryShowsCorrectnessLatencyAndStorageTradeoffs() throws Exception {
@@ -364,6 +417,10 @@ class TransactionRecoveryOnlinePerformanceTest {
     }
 
     private Run start(String mode, CandidateAdapter adapter) throws Exception {
+        return start(mode, adapter, 0);
+    }
+
+    private Run start(String mode, CandidateAdapter adapter, int requestedRate) throws Exception {
         String topic = "transaction-performance-" + mode + "-" + UUID.randomUUID();
         String group = topic;
         String bootstrap = broker.getBrokersAsString();
@@ -403,16 +460,25 @@ class TransactionRecoveryOnlinePerformanceTest {
             boolean reverse = index % 2 == 1;
             int firstSeq = reverse ? 1 : 0;
             int lastSeq = reverse ? 0 : 1;
+            pace(startNanos, index * 2, requestedRate);
             firstSentNanos.put(id, System.nanoTime());
             producer.send(new ProducerRecord<>(topic, 0, "ST-BENCH", observed(id, firstSeq)))
                     .get(10, TimeUnit.SECONDS);
             UUID lastId = UUID.randomUUID();
             lastEventIds.add(lastId);
+            pace(startNanos, index * 2 + 1, requestedRate);
             producer.send(new ProducerRecord<>(topic, 0, "ST-BENCH", observed(id, lastSeq, lastId)))
                     .get(10, TimeUnit.SECONDS);
         }
         return new Run(mode, topic, group, admin, producer, container, firstSentNanos,
                 candidateNanos, processed, startNanos, System.nanoTime());
+    }
+
+    private void pace(long startNanos, int recordIndex, int requestedRate) {
+        if (requestedRate <= 0) return;
+        long due = startNanos + TimeUnit.SECONDS.toNanos(recordIndex) / requestedRate;
+        long remaining;
+        while ((remaining = due - System.nanoTime()) > 0) LockSupport.parkNanos(remaining);
     }
 
     private ModeResult finish(Run run, CandidateAdapter adapter, int expectedCandidates, Duration timeout)

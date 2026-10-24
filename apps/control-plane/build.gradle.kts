@@ -38,6 +38,11 @@ tasks.test {
             layout.buildDirectory.file("experiment-results/exp-0002-online-performance.json").get().asFile.absolutePath)
     systemProperty("transaction.test.performance-enabled", project.findProperty("performanceEnabled")?.toString() ?: "false")
     systemProperty("transaction.test.window-seconds", project.findProperty("performanceWindowSeconds")?.toString() ?: "300")
+    systemProperty("transaction.test.isolated-mode", project.findProperty("performanceIsolatedMode")?.toString() ?: "")
+    systemProperty("transaction.test.isolated-rate", project.findProperty("performanceIsolatedRate")?.toString() ?: "20")
+    systemProperty("transaction.test.isolated-run", project.findProperty("performanceIsolatedRun")?.toString() ?: "1")
+    systemProperty("transaction.test.isolated-output-dir",
+            layout.buildDirectory.dir("experiment-results").get().asFile.absolutePath)
     systemProperty("exp0003.cdc.enabled", project.findProperty("exp0003Cdc")?.toString() ?: "false")
     systemProperty("exp0003.cdc.compose-file",
             rootProject.layout.projectDirectory.file("load-tests/outbox/compose.yaml").asFile.absolutePath)
