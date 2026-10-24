@@ -286,9 +286,31 @@ class OcppGatewayToInboxIntegrationTest {
                     WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
                     """).param("id", transactionId).query(Long.class).single()).isEqualTo(2);
 
+            assertThat(runExp0004OutboxChild("write", outputTopic, transactionId, "2501"))
+                    .isNotZero();
+            assertThat(Files.readString(directory.resolve("exp0004-write.log")))
+                    .contains("test closeout precondition failed or duplicate");
+            assertThat(exp0004Count("exp0004_closeout", transactionId, null)).isZero();
+            assertThat(exp0004Count("exp0004_outbox", transactionId, null)).isZero();
+            assertThat(readExp0004Output(outputTopic, 0)).isEmpty();
+
+            assertThat(runExp0004OutboxChild("write-rollback-before-outbox", outputTopic,
+                    transactionId)).isNotZero();
+            assertThat(Files.readString(directory.resolve("exp0004-write-rollback-before-outbox.log")))
+                    .contains("injected rollback before Outbox insert");
+            assertThat(exp0004Count("exp0004_closeout", transactionId, null)).isZero();
+            assertThat(exp0004Count("exp0004_outbox", transactionId, null)).isZero();
+
             assertThat(runExp0004OutboxChild("write-then-halt", outputTopic, transactionId)).isEqualTo(137);
             assertThat(Files.readString(directory.resolve("exp0004-write-then-halt.log")))
                     .contains("OUTBOX_COMMITTED_BEFORE_RELAY");
+            assertThat(exp0004Count("exp0004_closeout", transactionId, null)).isEqualTo(1);
+            assertThat(exp0004Count("exp0004_outbox", transactionId, false)).isEqualTo(1);
+            assertThat(readExp0004Output(outputTopic, 0)).isEmpty();
+
+            assertThat(runExp0004OutboxChild("write", outputTopic, transactionId)).isNotZero();
+            assertThat(Files.readString(directory.resolve("exp0004-write.log")))
+                    .contains("test closeout precondition failed or duplicate");
             assertThat(exp0004Count("exp0004_closeout", transactionId, null)).isEqualTo(1);
             assertThat(exp0004Count("exp0004_outbox", transactionId, false)).isEqualTo(1);
             assertThat(readExp0004Output(outputTopic, 0)).isEmpty();
@@ -679,13 +701,18 @@ class OcppGatewayToInboxIntegrationTest {
     }
 
     private int runExp0004OutboxChild(String mode, String topic, String transactionId) throws Exception {
+        return runExp0004OutboxChild(mode, topic, transactionId, "2500");
+    }
+
+    private int runExp0004OutboxChild(String mode, String topic, String transactionId,
+                                     String expectedWh) throws Exception {
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         String classpath = System.getProperty("transaction.test.runtime-classpath");
         assertThat(classpath).isNotBlank();
         var process = new ProcessBuilder(java, "-cp", classpath,
                 Exp0004OutboxPollingProcess.class.getName(), mode,
                 POSTGRES.getJdbcUrl("postgres", "postgres"), broker.getBrokersAsString(),
-                topic, transactionId, "2500")
+                topic, transactionId, expectedWh)
                 .redirectErrorStream(true)
                 .redirectOutput(directory.resolve("exp0004-" + mode + ".log").toFile())
                 .start();
