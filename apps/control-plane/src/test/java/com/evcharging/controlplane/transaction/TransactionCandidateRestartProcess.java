@@ -5,6 +5,7 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.listener.MessageListener;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.Map;
@@ -25,8 +26,11 @@ public final class TransactionCandidateRestartProcess {
         var inbox = context.getBean(JdbcTransactionInbox.class);
         var rules = context.getBean(TransactionRecoveryRules.class);
         var transactions = context.getBean(TransactionTemplate.class);
+        var jdbc = context.getBean(JdbcClient.class);
         int windowSeconds = context.getEnvironment().getProperty("transaction.test.window-seconds",
                 Integer.class, 30);
+        boolean restoreFromInbox = context.getEnvironment().getProperty(
+                "transaction.test.restore-from-inbox", Boolean.class, false);
         for (String mode : new String[] {"A", "B", "C"}) {
             String topic = context.getEnvironment().getRequiredProperty(
                     "transaction.test.topic-" + mode.toLowerCase());
@@ -38,7 +42,7 @@ public final class TransactionCandidateRestartProcess {
                         (MessageListener<String, String>) listener::consume);
             } else {
                 var adapter = new TransactionRecoveryOnlinePerformanceTest.CandidateAdapter(
-                        mode, windowSeconds, inbox, rules, transactions);
+                        mode, windowSeconds, inbox, rules, transactions, jdbc, restoreFromInbox);
                 Map<String, Long> candidateNanos = new ConcurrentHashMap<>();
                 container.getContainerProperties().setMessageListener((MessageListener<String, String>)
                         record -> adapter.accept(decoder.decode(record.key(), record.value()), candidateNanos));

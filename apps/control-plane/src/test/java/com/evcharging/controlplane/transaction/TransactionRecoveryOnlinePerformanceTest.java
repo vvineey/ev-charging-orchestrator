@@ -35,6 +35,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -47,6 +48,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -225,6 +227,60 @@ class TransactionRecoveryOnlinePerformanceTest {
     @Test
     void actualJvmTerminationAfterCommittedStartPreservesOnlyDurableCandidateProgress()
             throws Exception {
+        verifyJvmTerminationAfterCommittedStart(false);
+    }
+
+    @Test
+    void durableSourceRestoresTestOnlyCandidatesAfterJvmTermination() throws Exception {
+        verifyJvmTerminationAfterCommittedStart(true);
+    }
+
+    @Test
+    void restoredWindowRespectsExpiryAndIgnoresDuplicateSource() {
+        Map<String, Long> candidateNanos = new ConcurrentHashMap<>();
+        try (CandidateAdapter b = new CandidateAdapter("B", 1, inbox, rules, transactions,
+                jdbc, true)) {
+            String expiredId = "expired-window-" + UUID.randomUUID();
+            String start = observed(expiredId, 0);
+            b.accept(decoder.decode("ST-BENCH", start), candidateNanos);
+            b.accept(decoder.decode("ST-BENCH", start), candidateNanos);
+            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                    assertThat(b.windows).isEmpty());
+            String end = observed(expiredId, 1);
+            b.accept(decoder.decode("ST-BENCH", end), candidateNanos);
+            b.accept(decoder.decode("ST-BENCH", end), candidateNanos);
+            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                    assertThat(b.windows).isEmpty());
+            assertThat(countForTransaction("transaction_inbox_event", expiredId)).isEqualTo(2);
+            assertThat(countForTransaction("transaction_session_candidate", expiredId)).isZero();
+
+            String withinId = "within-window-" + UUID.randomUUID();
+            String withinStart = observed(withinId, 0);
+            String withinEnd = observed(withinId, 1);
+            b.accept(decoder.decode("ST-BENCH", withinStart), candidateNanos);
+            b.accept(decoder.decode("ST-BENCH", withinStart), candidateNanos);
+            b.accept(decoder.decode("ST-BENCH", withinEnd), candidateNanos);
+            b.accept(decoder.decode("ST-BENCH", withinEnd), candidateNanos);
+            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                    assertThat(countForTransaction("transaction_session_candidate", withinId))
+                            .isEqualTo(1));
+            assertThat(countForTransaction("transaction_inbox_event", withinId)).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void restoredArrivalStillRequiresStartBeforeEnd() {
+        String id = "reverse-arrival-" + UUID.randomUUID();
+        try (CandidateAdapter a = new CandidateAdapter("A", 0, inbox, rules, transactions,
+                jdbc, true)) {
+            a.accept(decoder.decode("ST-BENCH", observed(id, 1)), new ConcurrentHashMap<>());
+            a.accept(decoder.decode("ST-BENCH", observed(id, 0)), new ConcurrentHashMap<>());
+        }
+        assertThat(countForTransaction("transaction_inbox_event", id)).isEqualTo(2);
+        assertThat(countForTransaction("transaction_session_candidate", id)).isZero();
+    }
+
+    private void verifyJvmTerminationAfterCommittedStart(boolean restoreFromInbox) throws Exception {
         String runId = UUID.randomUUID().toString();
         Map<String, String> topics = Map.of(
                 "A", "transaction-jvm-A-" + runId,
@@ -243,7 +299,9 @@ class TransactionRecoveryOnlinePerformanceTest {
                      ProducerConfig.ACKS_CONFIG, "all"))) {
             admin.createTopics(topics.values().stream().map(topic -> new NewTopic(topic, 1, (short) 1))
                     .toList()).all().get(10, TimeUnit.SECONDS);
-            Process first = startCandidateProcess(topics, 30, "before-halt");
+            Process first = startCandidateProcess(topics, 30,
+                    (restoreFromInbox ? "restored-" : "baseline-") + "before-halt",
+                    restoreFromInbox);
             try {
                 for (String mode : List.of("A", "B", "C")) {
                     producer.send(new ProducerRecord<>(topics.get(mode), 0, "ST-BENCH",
@@ -265,7 +323,9 @@ class TransactionRecoveryOnlinePerformanceTest {
             }
             assertThat(first.exitValue()).isNotZero();
 
-            Process second = startCandidateProcess(topics, 5, "after-halt");
+            Process second = startCandidateProcess(topics, 30,
+                    (restoreFromInbox ? "restored-" : "baseline-") + "after-halt",
+                    restoreFromInbox);
             try {
                 for (String mode : List.of("A", "B", "C")) {
                     producer.send(new ProducerRecord<>(topics.get(mode), 0, "ST-BENCH",
@@ -280,19 +340,29 @@ class TransactionRecoveryOnlinePerformanceTest {
                 await().atMost(Duration.ofSeconds(20)).untilAsserted(() ->
                         assertThat(countForTransaction("transaction_session_candidate", ids.get("C")))
                                 .isEqualTo(1));
-                // B has received only Ended in this JVM. Let its new five-second window elapse.
-                Thread.sleep(7_000);
+                if (restoreFromInbox) {
+                    await().atMost(Duration.ofSeconds(35)).untilAsserted(() ->
+                            assertThat(countForTransaction("transaction_session_candidate", ids.get("B")))
+                                    .isEqualTo(1));
+                } else {
+                    // B has received only Ended in this JVM. Let the same 30-second window elapse.
+                    Thread.sleep(32_000);
+                }
                 for (String mode : List.of("A", "B", "C")) {
                     assertThat(countForTransaction("transaction_inbox_event", ids.get(mode))).isEqualTo(2);
                     assertThat(countForTransaction("transaction_session_candidate", ids.get(mode)))
                             .as("candidate %s after JVM halt", mode)
-                            .isEqualTo("C".equals(mode) ? 1 : 0);
+                            .isEqualTo(restoreFromInbox || "C".equals(mode) ? 1 : 0);
                 }
-                assertThat(jdbc.sql("""
-                        SELECT energy_wh FROM transaction_session_candidate
-                        WHERE transaction_id = :id
-                        """).param("id", ids.get("C")).query(Integer.class).single())
-                        .isEqualTo(2500);
+                for (String mode : List.of("A", "B", "C")) {
+                    if (restoreFromInbox || "C".equals(mode)) {
+                        assertThat(jdbc.sql("""
+                                SELECT energy_wh FROM transaction_session_candidate
+                                WHERE transaction_id = :id
+                                """).param("id", ids.get(mode)).query(Integer.class).single())
+                                .isEqualTo(2500);
+                    }
+                }
             } finally {
                 second.destroyForcibly();
                 assertThat(second.waitFor(10, TimeUnit.SECONDS)).isTrue();
@@ -301,7 +371,7 @@ class TransactionRecoveryOnlinePerformanceTest {
     }
 
     private Process startCandidateProcess(Map<String, String> topics, int windowSeconds,
-                                          String phase) throws IOException {
+                                          String phase, boolean restoreFromInbox) throws IOException {
         var builder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java")
                 .toString(), "-cp", System.getProperty("transaction.test.runtime-classpath"),
                 TransactionCandidateRestartProcess.class.getName(),
@@ -312,6 +382,7 @@ class TransactionRecoveryOnlinePerformanceTest {
                 "--transaction.test.topic-b=" + topics.get("B"),
                 "--transaction.test.topic-c=" + topics.get("C"),
                 "--transaction.test.window-seconds=" + windowSeconds,
+                "--transaction.test.restore-from-inbox=" + restoreFromInbox,
                 "--spring.kafka.consumer.properties[session.timeout.ms]=6000",
                 "--spring.kafka.consumer.properties[heartbeat.interval.ms]=1000");
         builder.environment().put("SPRING_DATASOURCE_URL", POSTGRES.getJdbcUrl("postgres", "postgres"));
@@ -595,25 +666,41 @@ class TransactionRecoveryOnlinePerformanceTest {
     }
 
     static final class CandidateAdapter implements AutoCloseable {
+        private record WindowEntry(String eventType, Instant occurredAt,
+                                   ObservedTransactionRecord lookup) { }
+        private record StoredWindowEntry(String eventType, Instant occurredAt,
+                                         Instant receivedAt) { }
+
         private final String mode;
         private final int windowSeconds;
         private final JdbcTransactionInbox inbox;
         private final TransactionRecoveryRules rules;
         private final TransactionTemplate transactions;
+        private final JdbcClient jdbc;
+        private final boolean restoreFromInbox;
         private final Map<String, Boolean> started = new ConcurrentHashMap<>();
-        private final Map<String, List<ObservedTransactionRecord>> windows = new ConcurrentHashMap<>();
+        private final Map<String, List<WindowEntry>> windows = new ConcurrentHashMap<>();
         private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
         CandidateAdapter(String mode, int windowSeconds, JdbcTransactionInbox inbox,
                          TransactionRecoveryRules rules, TransactionTemplate transactions) {
+            this(mode, windowSeconds, inbox, rules, transactions, null, false);
+        }
+
+        CandidateAdapter(String mode, int windowSeconds, JdbcTransactionInbox inbox,
+                         TransactionRecoveryRules rules, TransactionTemplate transactions,
+                         JdbcClient jdbc, boolean restoreFromInbox) {
             this.mode = mode;
             this.windowSeconds = windowSeconds;
             this.inbox = inbox;
             this.rules = rules;
             this.transactions = transactions;
+            this.jdbc = jdbc;
+            this.restoreFromInbox = restoreFromInbox;
         }
 
         void accept(ObservedTransactionRecord event, Map<String, Long> candidateNanos) {
+            AtomicBoolean inserted = new AtomicBoolean();
             boolean created = Boolean.TRUE.equals(transactions.execute(status -> {
                 JdbcTransactionInbox.State state = inbox.ensureAndLock(event);
                 if (!state.stationId().equals(event.stationId())) return false;
@@ -624,23 +711,73 @@ class TransactionRecoveryOnlinePerformanceTest {
                     }
                     return false;
                 }
+                inserted.set(true);
                 if ("A".equals(mode)) return applyArrival(event);
                 return false;
             }));
             if (created) candidateNanos.put(event.transactionId(), System.nanoTime());
             if ("B".equals(mode)) {
+                if (restoreFromInbox) {
+                    if (inserted.get()) restoreWindow(event, candidateNanos);
+                    return;
+                }
                 windows.compute(event.transactionId(), (id, existing) -> {
                     if (existing == null) {
-                        List<ObservedTransactionRecord> batch = new ArrayList<>();
-                        batch.add(event);
+                        List<WindowEntry> batch = new ArrayList<>();
+                        batch.add(new WindowEntry(event.eventType(), event.occurredAt(), event));
                         scheduler.schedule(() -> flush(id, batch, candidateNanos), windowSeconds,
                                 TimeUnit.SECONDS);
                         return batch;
                     }
-                    synchronized (existing) { existing.add(event); }
+                    synchronized (existing) {
+                        existing.add(new WindowEntry(event.eventType(), event.occurredAt(), event));
+                    }
                     return existing;
                 });
             }
+        }
+
+        private void restoreWindow(ObservedTransactionRecord event,
+                                   Map<String, Long> candidateNanos) {
+            // The source rows and receipt times are durable; the timer and batch are not.
+            List<StoredWindowEntry> stored = jdbc.sql("""
+                    SELECT event_type, occurred_at, first_received_at
+                    FROM transaction_inbox_event
+                    WHERE charging_station_id = :chargingStationId AND transaction_id = :transactionId
+                    ORDER BY first_received_at, seq_no
+                    """)
+                    .param("chargingStationId", event.chargingStationId())
+                    .param("transactionId", event.transactionId())
+                    .query((rs, row) -> new StoredWindowEntry(rs.getString("event_type"),
+                            rs.getObject("occurred_at", OffsetDateTime.class).toInstant(),
+                            rs.getObject("first_received_at", OffsetDateTime.class).toInstant()))
+                    .list();
+            Instant anchor = stored.getFirst().receivedAt();
+            long windowMillis = TimeUnit.SECONDS.toMillis(windowSeconds);
+            long bucket = Math.floorDiv(Duration.between(anchor, event.receivedAt()).toMillis(),
+                    windowMillis);
+            String key = event.transactionId() + ":" + bucket;
+            windows.compute(key, (id, existing) -> {
+                if (existing != null) {
+                    synchronized (existing) {
+                        existing.add(new WindowEntry(event.eventType(), event.occurredAt(), event));
+                    }
+                    return existing;
+                }
+                List<WindowEntry> batch = new ArrayList<>();
+                for (StoredWindowEntry row : stored) {
+                    long rowBucket = Math.floorDiv(Duration.between(anchor, row.receivedAt()).toMillis(),
+                            windowMillis);
+                    if (rowBucket == bucket) {
+                        batch.add(new WindowEntry(row.eventType(), row.occurredAt(), event));
+                    }
+                }
+                Instant deadline = anchor.plusMillis((bucket + 1) * windowMillis);
+                long delayMillis = Math.max(0, Duration.between(Instant.now(), deadline).toMillis());
+                scheduler.schedule(() -> flush(id, batch, candidateNanos), delayMillis,
+                        TimeUnit.MILLISECONDS);
+                return batch;
+            });
         }
 
         private boolean applyArrival(ObservedTransactionRecord event) {
@@ -649,7 +786,10 @@ class TransactionRecoveryOnlinePerformanceTest {
                 inbox.updateState(event, "OPEN", null, 1);
                 return false;
             }
-            if (!"Ended".equals(event.eventType()) || !Boolean.TRUE.equals(started.get(event.transactionId()))) {
+            boolean sawStart = Boolean.TRUE.equals(started.get(event.transactionId()))
+                    || restoreFromInbox && inbox.events(event).stream()
+                    .anyMatch(stored -> "Started".equals(stored.eventType()));
+            if (!"Ended".equals(event.eventType()) || !sawStart) {
                 return false;
             }
             TransactionRecoveryRules.Outcome outcome = rules.evaluate(inbox.events(event));
@@ -662,16 +802,17 @@ class TransactionRecoveryOnlinePerformanceTest {
             return true;
         }
 
-        private void flush(String id, List<ObservedTransactionRecord> batch,
+        private void flush(String id, List<WindowEntry> batch,
                            Map<String, Long> candidateNanos) {
-            List<ObservedTransactionRecord> copy;
+            List<WindowEntry> copy;
             synchronized (batch) { copy = new ArrayList<>(batch); }
             windows.remove(id, batch);
-            copy.sort(Comparator.comparing(ObservedTransactionRecord::occurredAt));
+            copy.sort(Comparator.comparing(WindowEntry::occurredAt));
             boolean sawStart = false;
-            for (ObservedTransactionRecord event : copy) {
-                if ("Started".equals(event.eventType())) sawStart = true;
-                if ("Ended".equals(event.eventType()) && sawStart) {
+            for (WindowEntry entry : copy) {
+                ObservedTransactionRecord event = entry.lookup();
+                if ("Started".equals(entry.eventType())) sawStart = true;
+                if ("Ended".equals(entry.eventType()) && sawStart) {
                     boolean created = Boolean.TRUE.equals(transactions.execute(status -> {
                         inbox.ensureAndLock(event);
                         TransactionRecoveryRules.Outcome outcome = rules.evaluate(inbox.events(event));
@@ -683,7 +824,7 @@ class TransactionRecoveryOnlinePerformanceTest {
                         inbox.updateState(event, "PROVISIONAL", null, outcome.evseId());
                         return true;
                     }));
-                    if (created) candidateNanos.put(id, System.nanoTime());
+                    if (created) candidateNanos.put(event.transactionId(), System.nanoTime());
                 }
             }
         }
