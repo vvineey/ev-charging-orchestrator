@@ -4,6 +4,7 @@ import com.evcharging.ocppgateway.OcppGatewayApplication;
 import io.zonky.test.db.postgres.embedded.EmbeddedPostgres;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -30,6 +31,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.node.ObjectNode;
+import tools.jackson.databind.node.ArrayNode;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
@@ -44,6 +46,7 @@ import java.nio.file.Path;
 import java.security.KeyStore;
 import java.sql.DriverManager;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.Base64;
@@ -191,6 +194,15 @@ class OcppGatewayToInboxIntegrationTest {
         Assumptions.assumeTrue(CLOSEOUT_WSS_TEST, "Fixed WSS closeout is an opt-in test-only path");
         String transactionId = "TX-EXP0004-WSS";
         String outputTopic = "exp0004-wss-closeout-" + UUID.randomUUID();
+        String runId = UUID.randomUUID().toString();
+        Path reconciliationFile = Path.of("build", "experiment-results",
+                "exp0004-wss-reconciliation-" + runId + ".json");
+        ObjectNode reconciliation = mapper.createObjectNode();
+        reconciliation.put("runId", runId);
+        reconciliation.put("scope", "test-only fixed WSS closeout; one Kafka broker and one partition");
+        reconciliation.put("inboxAgeDefinition", "milliseconds since first source event; test path has no BILLABLE transition");
+        reconciliation.put("samplingMode", "sequential DB and Kafka reads within each checkpoint; not an atomic snapshot");
+        ArrayNode checkpoints = reconciliation.putArray("checkpoints");
         try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()))) {
             admin.createTopics(List.of(new NewTopic(outputTopic, 1, (short) 1)))
                     .all().get(10, TimeUnit.SECONDS);
@@ -211,6 +223,7 @@ class OcppGatewayToInboxIntegrationTest {
                     transaction_id TEXT NOT NULL UNIQUE,
                     station_id TEXT NOT NULL,
                     payload TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                     published_at TIMESTAMPTZ
                 )
                 """).update();
@@ -285,6 +298,8 @@ class OcppGatewayToInboxIntegrationTest {
                     SELECT count(*) FROM transaction_inbox_event
                     WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
                     """).param("id", transactionId).query(Long.class).single()).isEqualTo(2);
+            captureExp0004Reconciliation(checkpoints, reconciliation, reconciliationFile,
+                    "source_captured", outputTopic, transactionId, null, null);
 
             assertThat(runExp0004OutboxChild("write", outputTopic, transactionId, "2501"))
                     .isNotZero();
@@ -300,6 +315,8 @@ class OcppGatewayToInboxIntegrationTest {
                     .contains("injected rollback before Outbox insert");
             assertThat(exp0004Count("exp0004_closeout", transactionId, null)).isZero();
             assertThat(exp0004Count("exp0004_outbox", transactionId, null)).isZero();
+            captureExp0004Reconciliation(checkpoints, reconciliation, reconciliationFile,
+                    "writer_rejected_and_rolled_back", outputTopic, transactionId, null, null);
 
             assertThat(runExp0004OutboxChild("write-then-halt", outputTopic, transactionId)).isEqualTo(137);
             assertThat(Files.readString(directory.resolve("exp0004-write-then-halt.log")))
@@ -307,6 +324,8 @@ class OcppGatewayToInboxIntegrationTest {
             assertThat(exp0004Count("exp0004_closeout", transactionId, null)).isEqualTo(1);
             assertThat(exp0004Count("exp0004_outbox", transactionId, false)).isEqualTo(1);
             assertThat(readExp0004Output(outputTopic, 0)).isEmpty();
+            captureExp0004Reconciliation(checkpoints, reconciliation, reconciliationFile,
+                    "writer_halted_after_commit", outputTopic, transactionId, null, null);
 
             assertThat(runExp0004OutboxChild("write", outputTopic, transactionId)).isNotZero();
             assertThat(Files.readString(directory.resolve("exp0004-write.log")))
@@ -314,6 +333,8 @@ class OcppGatewayToInboxIntegrationTest {
             assertThat(exp0004Count("exp0004_closeout", transactionId, null)).isEqualTo(1);
             assertThat(exp0004Count("exp0004_outbox", transactionId, false)).isEqualTo(1);
             assertThat(readExp0004Output(outputTopic, 0)).isEmpty();
+            captureExp0004Reconciliation(checkpoints, reconciliation, reconciliationFile,
+                    "writer_restarted", outputTopic, transactionId, null, null);
 
             assertThat(runExp0004OutboxChild("relay", outputTopic, transactionId)).isZero();
             assertThat(exp0004Count("exp0004_outbox", transactionId, true)).isEqualTo(1);
@@ -324,6 +345,8 @@ class OcppGatewayToInboxIntegrationTest {
                     """).param("id", transactionId).query(UUID.class).single().toString());
             assertThat(output.getFirst().path("payload").path("energyWh").decimalValue())
                     .isEqualByComparingTo("2500");
+            captureExp0004Reconciliation(checkpoints, reconciliation, reconciliationFile,
+                    "relay_recovered", outputTopic, transactionId, null, null);
             try (var effectDatabase = EmbeddedPostgres.builder().start()) {
                 String effectJdbcUrl = effectDatabase.getJdbcUrl("postgres", "postgres");
                 try (var connection = DriverManager.getConnection(effectJdbcUrl, "postgres", "postgres");
@@ -354,6 +377,10 @@ class OcppGatewayToInboxIntegrationTest {
                             .partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS)
                             .get(new TopicPartition(outputTopic, 0)).offset()).isEqualTo(1);
                 }
+                ObjectNode finalCheckpoint = captureExp0004Reconciliation(checkpoints, reconciliation,
+                        reconciliationFile, "consumer_recovered", outputTopic, transactionId,
+                        effectJdbcUrl, groupId);
+                assertThat(finalCheckpoint.path("finalReconciled").asBoolean()).isTrue();
             }
         }
     }
@@ -753,6 +780,173 @@ class OcppGatewayToInboxIntegrationTest {
         };
         return jdbc.sql(sql).param("id", transactionId).query(Long.class).single();
     }
+
+    private ObjectNode captureExp0004Reconciliation(ArrayNode checkpoints, ObjectNode report,
+                                                     Path file, String phase, String topic,
+                                                     String transactionId, String effectJdbcUrl,
+                                                     String effectGroupId) throws Exception {
+        Instant sampleStartedAt = Instant.now();
+        long inboxEvents = jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_event
+                WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single();
+        long conflicts = jdbc.sql("""
+                SELECT count(*) FROM transaction_inbox_conflict
+                WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).single();
+        String inboxStatus = jdbc.sql("""
+                SELECT status FROM transaction_inbox_state
+                WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
+                """).param("id", transactionId).query(String.class).single();
+        BigDecimal candidateWh = jdbc.sql("""
+                SELECT energy_wh FROM transaction_session_candidate
+                WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
+                """).param("id", transactionId).query(BigDecimal.class).optional().orElse(null);
+        String candidateStatus = jdbc.sql("""
+                SELECT candidate_status FROM transaction_session_candidate
+                WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
+                """).param("id", transactionId).query(String.class).optional().orElse(null);
+        Long inboxUnfinishedAgeMs = jdbc.sql("""
+                SELECT (EXTRACT(EPOCH FROM clock_timestamp() - min(first_received_at)) * 1000)::bigint
+                FROM transaction_inbox_event
+                WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
+                """).param("id", transactionId).query(Long.class).optional().orElse(null);
+        long closeouts = exp0004Count("exp0004_closeout", transactionId, null);
+        BigDecimal closeoutWh = jdbc.sql("""
+                SELECT energy_wh FROM exp0004_closeout WHERE transaction_id = :id
+                """).param("id", transactionId).query(BigDecimal.class).optional().orElse(null);
+        String closeoutEventId = jdbc.sql("""
+                SELECT event_id::text FROM exp0004_closeout WHERE transaction_id = :id
+                """).param("id", transactionId).query(String.class).optional().orElse(null);
+        long outboxRows = exp0004Count("exp0004_outbox", transactionId, null);
+        long pendingRows = exp0004Count("exp0004_outbox", transactionId, false);
+        String outboxEventId = jdbc.sql("""
+                SELECT event_id::text FROM exp0004_outbox WHERE transaction_id = :id
+                """).param("id", transactionId).query(String.class).optional().orElse(null);
+        Long pendingAgeMs = jdbc.sql("""
+                SELECT (EXTRACT(EPOCH FROM clock_timestamp() - created_at) * 1000)::bigint
+                FROM exp0004_outbox WHERE transaction_id = :id AND published_at IS NULL
+                """).param("id", transactionId).query(Long.class).optional().orElse(null);
+        List<JsonNode> output = readExp0004Output(topic, pendingRows == 0 && outboxRows > 0 ? 1 : 0);
+        String kafkaEventId = output.size() == 1 ? output.getFirst().path("eventId").asText() : null;
+        String kafkaTransactionId = output.size() == 1
+                ? output.getFirst().path("payload").path("transactionId").asText() : null;
+        BigDecimal kafkaWh = output.size() == 1
+                ? output.getFirst().path("payload").path("energyWh").decimalValue() : null;
+        String effectEventId = null;
+        long effectRows = 0;
+        if (effectJdbcUrl != null) {
+            try (var connection = DriverManager.getConnection(effectJdbcUrl, "postgres", "postgres");
+                 var statement = connection.prepareStatement("""
+                         SELECT event_id::text FROM exp0004_effect WHERE transaction_id = ?
+                         """)) {
+                statement.setString(1, transactionId);
+                try (var rows = statement.executeQuery()) {
+                    if (rows.next()) {
+                        effectRows = 1;
+                        effectEventId = rows.getString(1);
+                    }
+                }
+            }
+        }
+        OffsetSnapshot inboxOffset = offsetSnapshot("charging.transaction.observed.v1",
+                TransactionRecordListener.GROUP_ID);
+        OffsetSnapshot outputOffset = offsetSnapshot(topic, effectGroupId);
+        Boolean closeoutOutboxMatch = closeoutEventId == null || outboxEventId == null
+                ? null : closeoutEventId.equals(outboxEventId);
+        Boolean outboxKafkaMatch = outboxEventId == null || kafkaEventId == null
+                ? null : outboxEventId.equals(kafkaEventId);
+        Boolean kafkaEffectMatch = kafkaEventId == null || effectEventId == null
+                ? null : kafkaEventId.equals(effectEventId);
+        Boolean energyMatch = candidateWh == null || closeoutWh == null || kafkaWh == null
+                ? null : candidateWh.compareTo(closeoutWh) == 0 && closeoutWh.compareTo(kafkaWh) == 0;
+        Boolean transactionIdMatch = kafkaTransactionId == null
+                ? null : transactionId.equals(kafkaTransactionId);
+        boolean finalReconciled = inboxEvents == 2 && conflicts == 0 && closeouts == 1
+                && outboxRows == 1 && pendingRows == 0 && output.size() == 1 && effectRows == 1
+                && Boolean.TRUE.equals(closeoutOutboxMatch) && Boolean.TRUE.equals(outboxKafkaMatch)
+                && Boolean.TRUE.equals(kafkaEffectMatch) && Boolean.TRUE.equals(energyMatch)
+                && Boolean.TRUE.equals(transactionIdMatch)
+                && inboxOffset.lag() != null && inboxOffset.lag() == 0
+                && outputOffset.lag() != null && outputOffset.lag() == 0;
+        boolean mismatch = closeouts != outboxRows
+                || outboxRows > 0 && pendingRows == 0 && output.isEmpty()
+                || outboxRows == 0 && !output.isEmpty()
+                || effectRows > 0 && output.isEmpty()
+                || Boolean.FALSE.equals(closeoutOutboxMatch)
+                || Boolean.FALSE.equals(outboxKafkaMatch)
+                || Boolean.FALSE.equals(kafkaEffectMatch)
+                || Boolean.FALSE.equals(energyMatch)
+                || Boolean.FALSE.equals(transactionIdMatch)
+                || output.size() > 1 || effectRows > 1;
+        String reconciliationState = finalReconciled ? "RECONCILED"
+                : mismatch || effectJdbcUrl != null ? "MISMATCH"
+                : pendingRows > 0 ? "AWAITING_RELAY"
+                : output.isEmpty() ? "AWAITING_WRITER" : "AWAITING_CONSUMER";
+
+        ObjectNode snapshot = checkpoints.addObject();
+        snapshot.put("phase", phase);
+        snapshot.put("sampleStartedAt", sampleStartedAt.toString());
+        snapshot.put("sampleCompletedAt", Instant.now().toString());
+        snapshot.put("inboxStatus", inboxStatus);
+        snapshot.put("inboxEvents", inboxEvents);
+        snapshot.put("inboxConflicts", conflicts);
+        snapshot.put("candidateStatus", candidateStatus);
+        putOptionalLong(snapshot, "inboxUnfinishedAgeMs", inboxUnfinishedAgeMs);
+        snapshot.put("candidateEnergyWh", candidateWh == null ? null : candidateWh.toPlainString());
+        snapshot.put("closeouts", closeouts);
+        snapshot.put("outboxRows", outboxRows);
+        snapshot.put("outboxPendingRows", pendingRows);
+        putOptionalLong(snapshot, "outboxPendingAgeMs", pendingAgeMs);
+        snapshot.put("kafkaOutputRecords", output.size());
+        snapshot.put("effectState", effectJdbcUrl == null ? "NOT_STARTED" : "STARTED");
+        snapshot.put("effectRows", effectRows);
+        putOptionalBoolean(snapshot, "closeoutOutboxIdMatch", closeoutOutboxMatch);
+        putOptionalBoolean(snapshot, "outboxKafkaIdMatch", outboxKafkaMatch);
+        putOptionalBoolean(snapshot, "kafkaEffectIdMatch", kafkaEffectMatch);
+        putOptionalBoolean(snapshot, "energyWhMatch", energyMatch);
+        putOptionalBoolean(snapshot, "transactionIdMatch", transactionIdMatch);
+        snapshot.put("pendingPublication", pendingRows > 0 && output.isEmpty());
+        snapshot.put("reconciliationState", reconciliationState);
+        if (effectJdbcUrl == null) snapshot.putNull("finalReconciled");
+        else snapshot.put("finalReconciled", finalReconciled);
+        writeOffsetSnapshot(snapshot.putObject("inboxKafka"), inboxOffset);
+        writeOffsetSnapshot(snapshot.putObject("outputKafka"), outputOffset);
+        Files.createDirectories(file.getParent());
+        Files.writeString(file, mapper.writerWithDefaultPrettyPrinter().writeValueAsString(report));
+        return snapshot;
+    }
+
+    private OffsetSnapshot offsetSnapshot(String topic, String groupId) throws Exception {
+        var partition = new TopicPartition(topic, 0);
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()))) {
+            long latest = admin.listOffsets(Map.of(partition, OffsetSpec.latest()))
+                    .all().get(10, TimeUnit.SECONDS).get(partition).offset();
+            if (groupId == null) return new OffsetSnapshot(latest, null, null);
+            var committed = admin.listConsumerGroupOffsets(groupId)
+                    .partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS).get(partition);
+            Long offset = committed == null ? null : committed.offset();
+            return new OffsetSnapshot(latest, offset, offset == null ? null : latest - offset);
+        }
+    }
+
+    private void writeOffsetSnapshot(ObjectNode target, OffsetSnapshot source) {
+        target.put("latestOffset", source.latest());
+        putOptionalLong(target, "committedOffset", source.committed());
+        putOptionalLong(target, "lag", source.lag());
+    }
+
+    private void putOptionalLong(ObjectNode target, String field, Long value) {
+        if (value == null) target.putNull(field);
+        else target.put(field, value);
+    }
+
+    private void putOptionalBoolean(ObjectNode target, String field, Boolean value) {
+        if (value == null) target.putNull(field);
+        else target.put(field, value);
+    }
+
+    private record OffsetSnapshot(long latest, Long committed, Long lag) {}
 
     private List<JsonNode> readExp0004Output(String topic, int expected) throws Exception {
         var partition = new TopicPartition(topic, 0);
