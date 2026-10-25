@@ -8,6 +8,7 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import java.math.BigDecimal;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -72,11 +73,17 @@ public final class Exp0004OutboxPollingProcess {
                     payload = row.getString("payload");
                 }
             }
-            try (var producer = new KafkaProducer<String, String>(Map.of(
+            var producerProperties = new HashMap<String, Object>(Map.of(
                     ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, args[2],
                     ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
                     ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
-                    ProducerConfig.ACKS_CONFIG, "all"))) {
+                    ProducerConfig.ACKS_CONFIG, "all"));
+            if (Boolean.parseBoolean(System.getenv("EVC_WSS_OUTBOX_QUORUM_TEST"))) {
+                producerProperties.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 5000);
+                producerProperties.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 1000);
+                producerProperties.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 5000);
+            }
+            try (var producer = new KafkaProducer<String, String>(producerProperties)) {
                 producer.send(new ProducerRecord<>(args[3], stationId, payload)).get(10, TimeUnit.SECONDS);
             }
             if (haltAfterAck) {
