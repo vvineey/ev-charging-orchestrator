@@ -15,6 +15,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -27,12 +28,15 @@ import tools.jackson.databind.ObjectMapper;
 import javax.sql.DataSource;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -235,6 +239,102 @@ class Exp0003OutboxPollingTest {
         assertThat(Exp0003OutboxFixture.count(dataSource, "exp0003_delivery")).isEqualTo(16);
         assertThat(Exp0003OutboxFixture.count(dataSource, "exp0003_effect")).isEqualTo(16);
         assertThat(Exp0003OutboxFixture.missingEffects(dataSource)).isZero();
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "EVC_RELAY_BACKLOG_TEST", matches = "true")
+    void relayRestartDrainsTheRemainingBacklogAndReconcilesPhysicalDuplicates() throws Exception {
+        final int total = 64;
+        final int batchSize = 16;
+        String runId = UUID.randomUUID().toString();
+        var expectedByKey = new HashMap<String, UUID>();
+        for (int index = 0; index < total; index++) {
+            String key = "backlog-%02d".formatted(index);
+            expectedByKey.put(key, Exp0003OutboxFixture.commitWork(dataSource, key, false));
+        }
+        assertThat(Exp0003OutboxFixture.count(dataSource, "exp0003_work")).isEqualTo(total);
+        assertThat(Exp0003OutboxFixture.count(dataSource, "exp0003_outbox")).isEqualTo(total);
+        assertThat(crashChild("after-kafka-ack-before-delivery-commit", "unused", batchSize))
+                .isEqualTo(137);
+        assertThat(Exp0003OutboxFixture.count(dataSource, "exp0003_delivery")).isZero();
+        List<ConsumerRecord<String, String>> beforeRestart = readRecords(batchSize);
+        assertThat(beforeRestart).hasSize(batchSize);
+        Set<UUID> firstAckedIds = new HashSet<>();
+        for (var record : beforeRestart) {
+            UUID id = UUID.fromString(mapper.readTree(record.value()).path("eventId").asText());
+            assertThat(record.key()).isEqualTo(mapper.readTree(record.value()).path("workKey").asText());
+            assertThat(id).isEqualTo(expectedByKey.get(record.key()));
+            firstAckedIds.add(id);
+        }
+        assertThat(firstAckedIds).hasSize(batchSize);
+
+        long restartedAt = System.nanoTime();
+        int published = 0;
+        int batches = 0;
+        try (var restartedProducer = new KafkaProducer<String, String>(Map.of(
+                ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString(),
+                ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                ProducerConfig.ACKS_CONFIG, "all"))) {
+            while (published < total) {
+                int count = Exp0003OutboxFixture.pollBatch(dataSource, restartedProducer,
+                        topic, batchSize, () -> {});
+                assertThat(count).as("batch %s", batches).isBetween(1, batchSize);
+                published += count;
+                batches++;
+            }
+            assertThat(Exp0003OutboxFixture.pollBatch(dataSource, restartedProducer,
+                    topic, batchSize, () -> {})).isZero();
+        }
+        long deliveryMarkedAt = System.nanoTime();
+        List<ConsumerRecord<String, String>> afterRestart = readRecords(total + batchSize);
+        long kafkaScanCompletedAt = System.nanoTime();
+        assertThat(afterRestart).hasSize(total + batchSize);
+        var physicalById = new HashMap<UUID, Integer>();
+        for (var record : afterRestart) {
+            var body = mapper.readTree(record.value());
+            String key = body.path("workKey").asText();
+            UUID id = UUID.fromString(body.path("eventId").asText());
+            assertThat(id).isEqualTo(expectedByKey.get(key));
+            assertThat(record.key()).isEqualTo(key);
+            physicalById.merge(id, 1, Integer::sum);
+            Exp0003OutboxFixture.applyEffect(dataSource, id, key);
+        }
+        assertThat(physicalById).hasSize(total);
+        for (var entry : physicalById.entrySet()) {
+            assertThat(entry.getValue()).as("physical count for event %s", entry.getKey())
+                    .isEqualTo(firstAckedIds.contains(entry.getKey()) ? 2 : 1);
+        }
+        assertThat(published).isEqualTo(total);
+        assertThat(batches).isEqualTo(total / batchSize);
+        assertThat(Exp0003OutboxFixture.count(dataSource, "exp0003_delivery")).isEqualTo(total);
+        assertThat(Exp0003OutboxFixture.count(dataSource, "exp0003_effect")).isEqualTo(total);
+        assertThat(Exp0003OutboxFixture.missingEffects(dataSource)).isZero();
+        assertThat(Exp0003OutboxFixture.ghostEffects(dataSource)).isZero();
+
+        var result = mapper.createObjectNode();
+        result.put("runId", runId);
+        result.put("javaVersion", System.getProperty("java.version"));
+        result.put("model", "test-only synthetic Outbox; one embedded broker/partition");
+        result.put("outboxAtStop", total);
+        result.put("deliveryAtStop", 0);
+        result.put("kafkaPhysicalAtStop", beforeRestart.size());
+        result.put("childExitCode", 137);
+        result.put("restartBatchSize", batchSize);
+        result.put("restartBatches", batches);
+        result.put("restartPublished", published);
+        result.put("restartToDeliveryMarkedMs", (deliveryMarkedAt - restartedAt) / 1_000_000.0);
+        result.put("restartToKafkaFullScanMs", (kafkaScanCompletedAt - restartedAt) / 1_000_000.0);
+        result.put("finalOutbox", total);
+        result.put("finalDelivery", total);
+        result.put("finalKafkaPhysical", afterRestart.size());
+        result.put("finalKafkaUnique", physicalById.size());
+        result.put("finalEffects", total);
+        result.put("finalMissingEffects", 0);
+        result.put("finalGhostEffects", 0);
+        Path output = Path.of("build", "experiment-results", "relay-backlog-" + runId + ".json");
+        Files.createDirectories(output.getParent());
+        Files.writeString(output, mapper.writerWithDefaultPrettyPrinter().writeValueAsString(result));
     }
 
     private int crashChild(String mode, String key) throws Exception {
