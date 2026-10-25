@@ -8,6 +8,8 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.errors.NotEnoughReplicasAfterAppendException;
+import org.apache.kafka.common.errors.NotEnoughReplicasException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
@@ -26,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
@@ -38,6 +41,134 @@ class KafkaThreeBrokerFailoverTest {
     private static final String BOOTSTRAP = "127.0.0.1:19101,127.0.0.1:19102,127.0.0.1:19103";
     private static final int EVENTS = 100;
     private static final Path COMPOSE = Path.of(System.getProperty("kafka.failover.compose"));
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "EVC_KAFKA_FAILOVER_TEST", matches = "true")
+    void minIsrBoundaryRejectsWritesThenRecoversAfterTheLeaderReturns() throws Exception {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String availableTopic = "exp76-minisr2-" + suffix;
+        String strictTopic = "exp76-minisr3-" + suffix;
+        String baselineId = "exp76-baseline";
+        String affectedId = "exp76-after-leader-kill";
+        var assignment = Map.of(0, List.of(1, 2, 3));
+        int killedLeader = -1;
+        boolean brokerKilled = false;
+        long started = System.nanoTime();
+
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", BOOTSTRAP));
+             var resilientProducer = producer();
+             var failFastProducer = failFastProducer()) {
+            assertEquals(3, admin.describeCluster().nodes().get(20, TimeUnit.SECONDS).size());
+            admin.createTopics(List.of(
+                    new NewTopic(availableTopic, assignment).configs(Map.of("min.insync.replicas", "2")),
+                    new NewTopic(strictTopic, assignment).configs(Map.of("min.insync.replicas", "3"))))
+                    .all().get(20, TimeUnit.SECONDS);
+            var healthyAvailable = awaitPartition(admin, availableTopic, 3, -1, Duration.ofSeconds(30));
+            var healthyStrict = awaitPartition(admin, strictTopic, 3, -1, Duration.ofSeconds(30));
+            assertEquals(healthyAvailable.leaderId(), healthyStrict.leaderId());
+            killedLeader = healthyAvailable.leaderId();
+            assertEquals(List.of(1, 2, 3), healthyAvailable.replicaIds());
+            assertEquals(List.of(1, 2, 3), healthyStrict.replicaIds());
+            long baselineAvailableOffset = resilientProducer.send(
+                    new ProducerRecord<>(availableTopic, "station-1", baselineId))
+                    .get(15, TimeUnit.SECONDS).offset();
+            long baselineStrictOffset = resilientProducer.send(
+                    new ProducerRecord<>(strictTopic, "station-1", baselineId))
+                    .get(15, TimeUnit.SECONDS).offset();
+            assertEquals(0, baselineAvailableOffset);
+            assertEquals(0, baselineStrictOffset);
+
+            long killStarted = System.nanoTime();
+            docker("kill", "-s", "SIGKILL", "broker" + killedLeader);
+            brokerKilled = true;
+            var degradedAvailable = awaitPartition(admin, availableTopic, 2, killedLeader, Duration.ofSeconds(30));
+            var degradedStrict = awaitPartition(admin, strictTopic, 2, killedLeader, Duration.ofSeconds(30));
+            assertFalse(degradedAvailable.isrIds().contains(killedLeader));
+            assertFalse(degradedStrict.isrIds().contains(killedLeader));
+            assertEquals(java.util.Set.copyOf(degradedAvailable.isrIds()),
+                    java.util.Set.copyOf(degradedStrict.isrIds()), "comparison topics must have the same ISR");
+            long degradedObserved = System.nanoTime();
+
+            // Disable producer retries here to expose the broker's min ISR decision to the caller.
+            long rejectedStarted = System.nanoTime();
+            String rejectionType;
+            try {
+                failFastProducer.send(new ProducerRecord<>(strictTopic, "station-1", affectedId))
+                        .get(8, TimeUnit.SECONDS);
+                throw new AssertionError("min.insync.replicas=3 unexpectedly acknowledged an ISR=2 write");
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                assertTrue(cause instanceof NotEnoughReplicasException
+                                || cause instanceof NotEnoughReplicasAfterAppendException,
+                        "expected min ISR rejection, got " + cause.getClass().getName());
+                rejectionType = cause.getClass().getSimpleName();
+            }
+            long rejectedAt = System.nanoTime();
+
+            long availableStarted = System.nanoTime();
+            long availableOffset = resilientProducer.send(
+                    new ProducerRecord<>(availableTopic, "station-1", affectedId))
+                    .get(15, TimeUnit.SECONDS).offset();
+            long availableAckAt = System.nanoTime();
+            assertEquals(1, availableOffset);
+
+            long restartStarted = System.nanoTime();
+            docker("up", "-d", "--wait", "broker" + killedLeader);
+            var restoredAvailable = awaitPartition(admin, availableTopic, 3, -1, Duration.ofSeconds(60));
+            var restoredStrict = awaitPartition(admin, strictTopic, 3, -1, Duration.ofSeconds(60));
+            brokerKilled = false;
+            assertTrue(restoredAvailable.isrIds().contains(killedLeader));
+            assertTrue(restoredStrict.isrIds().contains(killedLeader));
+            long isrRestoredAt = System.nanoTime();
+            long recoveryStarted = System.nanoTime();
+            long recoveredOffset = resilientProducer.send(
+                    new ProducerRecord<>(strictTopic, "station-1", affectedId))
+                    .get(15, TimeUnit.SECONDS).offset();
+            long recoveryAckAt = System.nanoTime();
+
+            var availableCounts = consumeCounts(availableTopic, admin);
+            var strictCounts = consumeCounts(strictTopic, admin);
+            var expectedIds = java.util.Set.of(baselineId, affectedId);
+            assertEquals(expectedIds, availableCounts.keySet());
+            assertEquals(expectedIds, strictCounts.keySet());
+            assertEquals(Map.of(baselineId, 1, affectedId, 1), availableCounts);
+            assertEquals(Map.of(baselineId, 1, affectedId, 1), strictCounts,
+                    "failed attempt followed by recovery must not create a physical duplicate");
+
+            var result = new LinkedHashMap<String, Object>();
+            result.put("observedAt", Instant.now().toString());
+            result.put("brokerCount", 3);
+            result.put("replicationFactor", 3);
+            result.put("producerAcks", "all");
+            result.put("killedLeader", killedLeader);
+            result.put("availableMinIsr", 2);
+            result.put("strictMinIsr", 3);
+            result.put("healthyIsrIds", healthyAvailable.isrIds());
+            result.put("degradedIsrIds", degradedAvailable.isrIds());
+            result.put("restoredIsrIds", restoredAvailable.isrIds());
+            result.put("killToDegradedObservedMs", millis(degradedObserved - killStarted));
+            result.put("strictRejectionType", rejectionType);
+            result.put("strictRejectionLatencyMs", millis(rejectedAt - rejectedStarted));
+            result.put("availableAckLatencyWhileDegradedMs", millis(availableAckAt - availableStarted));
+            result.put("availableAckOffsetWhileDegraded", availableOffset);
+            result.put("restartToIsrThreeObservedMs", millis(isrRestoredAt - restartStarted));
+            result.put("strictRecoveryAckLatencyMs", millis(recoveryAckAt - recoveryStarted));
+            result.put("strictRecoveryAckOffset", recoveredOffset);
+            result.put("availableFinalCounts", availableCounts);
+            result.put("strictFinalCounts", strictCounts);
+            result.put("experimentElapsedMs", millis(System.nanoTime() - started));
+            String output = System.getenv().getOrDefault("EVC_KAFKA_MIN_ISR_OUTPUT",
+                    "apps/telemetry-worker/build/experiment-results/kafka-min-isr-boundary.json");
+            Path path = Path.of(output).toAbsolutePath();
+            Files.createDirectories(path.getParent());
+            new ObjectMapper().writerWithDefaultPrettyPrinter().writeValue(path.toFile(), result);
+            System.out.println("Kafka min ISR boundary result: " + path);
+        } finally {
+            if (brokerKilled) {
+                docker("up", "-d", "--wait", "broker" + killedLeader);
+            }
+        }
+    }
 
     @Test
     @EnabledIfEnvironmentVariable(named = "EVC_KAFKA_FAILOVER_TEST", matches = "true")
@@ -143,6 +274,20 @@ class KafkaThreeBrokerFailoverTest {
         config.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 3000);
         config.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 10000);
         config.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 1);
+        return new KafkaProducer<>(config);
+    }
+
+    private static KafkaProducer<String, String> failFastProducer() {
+        var config = new HashMap<String, Object>();
+        config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
+        config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        config.put(ProducerConfig.ACKS_CONFIG, "all");
+        config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, false);
+        config.put(ProducerConfig.RETRIES_CONFIG, 0);
+        config.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 3000);
+        config.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 5000);
+        config.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 5000);
         return new KafkaProducer<>(config);
     }
 
