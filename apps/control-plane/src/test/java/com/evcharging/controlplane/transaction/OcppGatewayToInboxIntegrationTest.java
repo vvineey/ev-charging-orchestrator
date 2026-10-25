@@ -22,6 +22,7 @@ import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.core.env.MapPropertySource;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.test.EmbeddedKafkaBroker;
@@ -72,6 +73,10 @@ class OcppGatewayToInboxIntegrationTest {
             Boolean.parseBoolean(System.getenv("EVC_SAP_INBOX_PROVISIONAL"));
     private static final boolean CLOSEOUT_WSS_TEST =
             Boolean.parseBoolean(System.getenv("EVC_WSS_CLOSEOUT_TEST"));
+    private static final boolean OUTBOX_QUORUM_TEST =
+            Boolean.parseBoolean(System.getenv("EVC_WSS_OUTBOX_QUORUM_TEST"));
+    private static final String OUTBOX_QUORUM_BROKERS = System.getenv().getOrDefault(
+            "EVC_WSS_OUTBOX_QUORUM_BROKERS", "127.0.0.1:19201,127.0.0.1:19202,127.0.0.1:19203");
     private static final EmbeddedPostgres POSTGRES;
     static {
         try {
@@ -87,7 +92,10 @@ class OcppGatewayToInboxIntegrationTest {
         registry.add("spring.datasource.username", () -> "postgres");
         registry.add("spring.datasource.password", () -> "postgres");
         registry.add("transaction.recovery.experimental-candidate-calculation-enabled",
-                () -> PROVISIONAL_SAP_TEST || CLOSEOUT_WSS_TEST);
+                () -> PROVISIONAL_SAP_TEST || CLOSEOUT_WSS_TEST || OUTBOX_QUORUM_TEST);
+        if (OUTBOX_QUORUM_TEST) {
+            registry.add("spring.kafka.bootstrap-servers", () -> OUTBOX_QUORUM_BROKERS);
+        }
     }
 
     @AfterAll
@@ -101,9 +109,13 @@ class OcppGatewayToInboxIntegrationTest {
     @Autowired KafkaListenerEndpointRegistry listenerRegistry;
     @TempDir Path directory;
 
+    private String bootstrapServers() {
+        return OUTBOX_QUORUM_TEST ? OUTBOX_QUORUM_BROKERS : broker.getBrokersAsString();
+    }
+
     @Test
     void wssGatewayKafkaAndInboxPreserveEvseAbsenceAndAllMeterGroups() throws Exception {
-        Assumptions.assumeFalse(PROVISIONAL_SAP_TEST || CLOSEOUT_WSS_TEST,
+        Assumptions.assumeFalse(PROVISIONAL_SAP_TEST || CLOSEOUT_WSS_TEST || OUTBOX_QUORUM_TEST,
                 "Opt-in candidate run selects an experimental transaction only");
         var tls = new LocalTls(directory);
         try (var gateway = startGateway(tls, "CS-E2E")) {
@@ -191,20 +203,27 @@ class OcppGatewayToInboxIntegrationTest {
 
     @Test
     void fixedWssTransactionKeepsOutboxIntentAcrossWriterCrash() throws Exception {
-        Assumptions.assumeTrue(CLOSEOUT_WSS_TEST, "Fixed WSS closeout is an opt-in test-only path");
+        Assumptions.assumeTrue(CLOSEOUT_WSS_TEST || OUTBOX_QUORUM_TEST,
+                "Fixed WSS closeout is an opt-in test-only path");
         String transactionId = "TX-EXP0004-WSS";
         String outputTopic = "exp0004-wss-closeout-" + UUID.randomUUID();
         String runId = UUID.randomUUID().toString();
-        Path reconciliationFile = Path.of("build", "experiment-results",
-                "exp0004-wss-reconciliation-" + runId + ".json");
+        Path reconciliationFile = OUTBOX_QUORUM_TEST
+                ? Path.of(System.getenv().getOrDefault("EVC_WSS_OUTBOX_QUORUM_OUTPUT",
+                        "build/experiment-results/wss-outbox-quorum-" + runId + ".json"))
+                : Path.of("build", "experiment-results", "exp0004-wss-reconciliation-" + runId + ".json");
         ObjectNode reconciliation = mapper.createObjectNode();
         reconciliation.put("runId", runId);
-        reconciliation.put("scope", "test-only fixed WSS closeout; one Kafka broker and one partition");
+        reconciliation.put("scope", OUTBOX_QUORUM_TEST
+                ? "WSS ingress, test-only closeout/Outbox/Relay/effect; three isolated brokers and one partition"
+                : "test-only fixed WSS closeout; one Kafka broker and one partition");
         reconciliation.put("inboxAgeDefinition", "milliseconds since first source event; test path has no BILLABLE transition");
         reconciliation.put("samplingMode", "sequential DB and Kafka reads within each checkpoint; not an atomic snapshot");
         ArrayNode checkpoints = reconciliation.putArray("checkpoints");
-        try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()))) {
-            admin.createTopics(List.of(new NewTopic(outputTopic, 1, (short) 1)))
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", bootstrapServers()))) {
+            NewTopic outputDefinition = new NewTopic(outputTopic, 1, (short) (OUTBOX_QUORUM_TEST ? 3 : 1));
+            if (OUTBOX_QUORUM_TEST) outputDefinition.configs(Map.of("min.insync.replicas", "2"));
+            admin.createTopics(List.of(outputDefinition))
                     .all().get(10, TimeUnit.SECONDS);
         }
         jdbc.sql("""
@@ -230,6 +249,8 @@ class OcppGatewayToInboxIntegrationTest {
 
         var tls = new LocalTls(directory);
         try (var gateway = startGateway(tls, "CS-TEST", "ST-TEST")) {
+            assertThat(gateway.getEnvironment().getProperty("spring.kafka.bootstrap-servers"))
+                    .isEqualTo(bootstrapServers());
             int port = Integer.parseInt(gateway.getEnvironment().getRequiredProperty("local.server.port"));
             var replies = new ArrayBlockingQueue<String>(2);
             try (var client = HttpClient.newBuilder().sslContext(tls.trustedContext).build()) {
@@ -286,7 +307,7 @@ class OcppGatewayToInboxIntegrationTest {
                 assertThat(jdbc.sql("""
                         SELECT candidate_status FROM transaction_session_candidate
                         WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id
-                        """).param("id", transactionId).query(String.class).single())
+                        """).param("id", transactionId).query(String.class).optional().orElse(null))
                         .isEqualTo("PROVISIONAL");
             });
             assertThat(jdbc.sql("""
@@ -336,6 +357,10 @@ class OcppGatewayToInboxIntegrationTest {
             captureExp0004Reconciliation(checkpoints, reconciliation, reconciliationFile,
                     "writer_restarted", outputTopic, transactionId, null, null);
 
+            if (OUTBOX_QUORUM_TEST) {
+                verifyOutboxQuorumFailureAndRecovery(checkpoints, reconciliation,
+                        reconciliationFile, outputTopic, transactionId);
+            }
             assertThat(runExp0004OutboxChild("relay", outputTopic, transactionId)).isZero();
             assertThat(exp0004Count("exp0004_outbox", transactionId, true)).isEqualTo(1);
             var output = readExp0004Output(outputTopic, 0);
@@ -372,7 +397,7 @@ class OcppGatewayToInboxIntegrationTest {
                         assertThat(rows.getLong(1)).isEqualTo(1);
                     }
                 }
-                try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()))) {
+                try (var admin = AdminClient.create(Map.of("bootstrap.servers", bootstrapServers()))) {
                     assertThat(admin.listConsumerGroupOffsets(groupId)
                             .partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS)
                             .get(new TopicPartition(outputTopic, 0)).offset()).isEqualTo(1);
@@ -385,9 +410,102 @@ class OcppGatewayToInboxIntegrationTest {
         }
     }
 
+    private void verifyOutboxQuorumFailureAndRecovery(ArrayNode checkpoints, ObjectNode report,
+            Path file, String topic, String transactionId) throws Exception {
+        BrokerSnapshot healthy = brokerSnapshot(topic);
+        assertThat(healthy.replicas()).hasSize(3);
+        assertThat(healthy.isr()).hasSize(3);
+        int killedLeader = healthy.leader();
+        int killedFollower = healthy.replicas().stream()
+                .filter(id -> id != killedLeader).findFirst().orElseThrow();
+        long killStarted = System.nanoTime();
+        runQuorumCompose("kill", "-s", "SIGKILL",
+                "broker" + killedLeader, "broker" + killedFollower);
+        long restartStarted;
+        try {
+            await().atMost(Duration.ofSeconds(45)).pollInterval(Duration.ofMillis(300))
+                    .untilAsserted(() -> {
+                        BrokerSnapshot degraded = brokerSnapshot(topic);
+                        assertThat(degraded.leader()).isNotEqualTo(killedLeader);
+                        assertThat(degraded.isr()).hasSize(1);
+                    });
+            BrokerSnapshot degraded = brokerSnapshot(topic);
+            long degradedObserved = System.nanoTime();
+            int relayExitCode = runExp0004OutboxChild("relay", topic, transactionId);
+            long failureObserved = System.nanoTime();
+            String relayLog = Files.readString(directory.resolve("exp0004-relay.log"));
+            assertThat(relayExitCode).as("Relay must fail while ISR is below minISR=2").isNotZero();
+            assertThat(relayLog).containsAnyOf("NotEnoughReplicasException", "TimeoutException");
+            assertThat(exp0004Count("exp0004_outbox", transactionId, false)).isEqualTo(1);
+            assertThat(exp0004Count("exp0004_outbox", transactionId, true)).isZero();
+            ObjectNode failure = checkpoints.addObject();
+            failure.put("phase", "relay_rejected_below_min_isr");
+            failure.put("sampledAt", Instant.now().toString());
+            failure.put("initialLeader", killedLeader);
+            failure.put("survivingLeader", degraded.leader());
+            failure.put("initialIsr", healthy.isr().size());
+            failure.put("degradedIsr", degraded.isr().size());
+            failure.put("configuredMinIsr", 2);
+            failure.put("relayExitCode", relayExitCode);
+            failure.put("relayFailureType", relayLog.contains("NotEnoughReplicasException")
+                    ? "NotEnoughReplicasException" : "TimeoutException");
+            failure.put("outboxPending", 1);
+            failure.put("outboxPublished", 0);
+            failure.put("outboxPendingAgeMs", jdbc.sql("""
+                    SELECT (EXTRACT(EPOCH FROM clock_timestamp() - created_at) * 1000)::bigint
+                    FROM exp0004_outbox WHERE transaction_id = :id AND published_at IS NULL
+                    """).param("id", transactionId).query(Long.class).single());
+            failure.put("killToDegradedObservedMs", (degradedObserved - killStarted) / 1_000_000.0);
+            failure.put("degradedToRelayFailureMs", (failureObserved - degradedObserved) / 1_000_000.0);
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, mapper.writerWithDefaultPrettyPrinter().writeValueAsString(report));
+        } finally {
+            restartStarted = System.nanoTime();
+            runQuorumCompose("start", "broker" + killedLeader, "broker" + killedFollower);
+        }
+        await().atMost(Duration.ofSeconds(45)).pollInterval(Duration.ofMillis(300))
+                .untilAsserted(() -> assertThat(brokerSnapshot(topic).isr()).hasSize(3));
+        assertThat(readExp0004Output(topic, 0)).isEmpty();
+        assertThat(exp0004Count("exp0004_outbox", transactionId, false)).isEqualTo(1);
+        report.put("brokerRestartToIsrThreeMs", (System.nanoTime() - restartStarted) / 1_000_000.0);
+        captureExp0004Reconciliation(checkpoints, report, file,
+                "brokers_restored_before_relay_retry", topic, transactionId, null, null);
+    }
+
+    private BrokerSnapshot brokerSnapshot(String topic) throws Exception {
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", bootstrapServers()))) {
+            var partition = admin.describeTopics(List.of(topic)).allTopicNames()
+                    .get(10, TimeUnit.SECONDS).get(topic).partitions().getFirst();
+            return new BrokerSnapshot(partition.leader().id(),
+                    partition.replicas().stream().map(org.apache.kafka.common.Node::id).toList(),
+                    partition.isr().stream().map(org.apache.kafka.common.Node::id).toList());
+        }
+    }
+
+    private void runQuorumCompose(String... arguments) throws Exception {
+        String composeFile = System.getenv("EVC_WSS_OUTBOX_QUORUM_COMPOSE");
+        assertThat(composeFile).as("isolated Kafka Compose file").isNotBlank();
+        var command = new ArrayList<String>();
+        command.addAll(List.of("docker", "compose", "-f", composeFile));
+        command.addAll(List.of(arguments));
+        var process = new ProcessBuilder(command).redirectErrorStream(true)
+                .redirectOutput(directory.resolve("exp0004-compose-" + arguments[0] + ".log").toFile())
+                .start();
+        if (!process.waitFor(30, TimeUnit.SECONDS)) {
+            process.destroyForcibly();
+            throw new IllegalStateException("Kafka Compose did not finish in 30 seconds");
+        }
+        assertThat(process.exitValue())
+                .as("Kafka Compose %s: %s", arguments[0],
+                        Files.readString(directory.resolve("exp0004-compose-" + arguments[0] + ".log")))
+                .isZero();
+    }
+
+    private record BrokerSnapshot(int leader, List<Integer> replicas, List<Integer> isr) {}
+
     @Test
     void pinnedSapSimulatorTransactionDistinguishesSameAndChangedSourceReplays() throws Exception {
-        Assumptions.assumeTrue(!CLOSEOUT_WSS_TEST || PROVISIONAL_SAP_TEST,
+        Assumptions.assumeTrue(!(CLOSEOUT_WSS_TEST || OUTBOX_QUORUM_TEST) || PROVISIONAL_SAP_TEST,
                 "Pinned SAP HOLD expectation requires candidate calculation to be disabled");
         String simulatorDirectory = System.getenv("EVC_SAP_INBOX_SIMULATOR_DIR");
         Assumptions.assumeTrue(simulatorDirectory != null && Files.isDirectory(Path.of(simulatorDirectory)),
@@ -640,7 +758,7 @@ class OcppGatewayToInboxIntegrationTest {
             builder.environment().put("SPRING_DATASOURCE_URL", POSTGRES.getJdbcUrl("postgres", "postgres"));
             builder.environment().put("SPRING_DATASOURCE_USERNAME", "postgres");
             builder.environment().put("SPRING_DATASOURCE_PASSWORD", "postgres");
-            builder.environment().put("SPRING_KAFKA_BOOTSTRAPSERVERS", broker.getBrokersAsString());
+            builder.environment().put("SPRING_KAFKA_BOOTSTRAPSERVERS", bootstrapServers());
             builder.redirectErrorStream(true).redirectOutput(directory.resolve("sap-conflict-crash-process.log").toFile());
             Process child = builder.start();
             try {
@@ -707,7 +825,7 @@ class OcppGatewayToInboxIntegrationTest {
     private long publish(String record) throws Exception {
         String topic = "charging.transaction.observed.v1";
         try (var producer = new KafkaProducer<String, String>(Map.of(
-                ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString(),
+                ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers(),
                 ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
                 ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
                 ProducerConfig.ACKS_CONFIG, "all"))) {
@@ -717,7 +835,7 @@ class OcppGatewayToInboxIntegrationTest {
     }
 
     private long inboxOffset() throws Exception {
-        try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()))) {
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", bootstrapServers()))) {
             return admin.listConsumerGroupOffsets(TransactionRecordListener.GROUP_ID)
                     .partitionsToOffsetAndMetadata().get(10, TimeUnit.SECONDS)
                     .get(new TopicPartition("charging.transaction.observed.v1", 0)).offset();
@@ -740,7 +858,7 @@ class OcppGatewayToInboxIntegrationTest {
         assertThat(classpath).isNotBlank();
         var process = new ProcessBuilder(java, "-cp", classpath,
                 Exp0004OutboxPollingProcess.class.getName(), mode,
-                POSTGRES.getJdbcUrl("postgres", "postgres"), broker.getBrokersAsString(),
+                POSTGRES.getJdbcUrl("postgres", "postgres"), bootstrapServers(),
                 topic, transactionId, expectedWh)
                 .redirectErrorStream(true)
                 .redirectOutput(directory.resolve("exp0004-" + mode + ".log").toFile())
@@ -759,7 +877,7 @@ class OcppGatewayToInboxIntegrationTest {
         assertThat(classpath).isNotBlank();
         var process = new ProcessBuilder(java, "-cp", classpath,
                 Exp0004IndependentConsumerProcess.class.getName(), "normal",
-                broker.getBrokersAsString(), topic, effectJdbcUrl, groupId, "1")
+                bootstrapServers(), topic, effectJdbcUrl, groupId, "1")
                 .redirectErrorStream(true)
                 .redirectOutput(directory.resolve("exp0004-independent-consumer.log").toFile())
                 .start();
@@ -919,7 +1037,7 @@ class OcppGatewayToInboxIntegrationTest {
 
     private OffsetSnapshot offsetSnapshot(String topic, String groupId) throws Exception {
         var partition = new TopicPartition(topic, 0);
-        try (var admin = AdminClient.create(Map.of("bootstrap.servers", broker.getBrokersAsString()))) {
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", bootstrapServers()))) {
             long latest = admin.listOffsets(Map.of(partition, OffsetSpec.latest()))
                     .all().get(10, TimeUnit.SECONDS).get(partition).offset();
             if (groupId == null) return new OffsetSnapshot(latest, null, null);
@@ -951,7 +1069,7 @@ class OcppGatewayToInboxIntegrationTest {
     private List<JsonNode> readExp0004Output(String topic, int expected) throws Exception {
         var partition = new TopicPartition(topic, 0);
         try (var consumer = new KafkaConsumer<String, String>(Map.of(
-                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, broker.getBrokersAsString(),
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers(),
                 ConsumerConfig.GROUP_ID_CONFIG, "exp0004-wss-output-" + UUID.randomUUID(),
                 ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
                 ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
@@ -979,6 +1097,9 @@ class OcppGatewayToInboxIntegrationTest {
                                                       String stationId) {
         return new SpringApplicationBuilder(OcppGatewayApplication.class)
                 .web(WebApplicationType.SERVLET)
+                .initializers(context -> context.getEnvironment().getPropertySources().addFirst(
+                        new MapPropertySource("testKafkaBootstrap",
+                                Map.of("spring.kafka.bootstrap-servers", bootstrapServers()))))
                 .properties("server.address=127.0.0.1", "server.port=0", "server.ssl.enabled=true",
                         "server.ssl.key-store=" + tls.keyStore.toUri(),
                         "server.ssl.key-store-password=" + tls.password,
@@ -986,7 +1107,7 @@ class OcppGatewayToInboxIntegrationTest {
                         "ocpp.station.station-id=" + stationId, "ocpp.station.allowed-evse-ids=1",
                         "ocpp.station.password=test-credential-only",
                         "ocpp.kafka-topic=charging.transaction.observed.v1",
-                        "spring.kafka.bootstrap-servers=" + broker.getBrokersAsString(),
+                        "spring.kafka.bootstrap-servers=" + bootstrapServers(),
                         "spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer",
                         "spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer")
                 .run();
