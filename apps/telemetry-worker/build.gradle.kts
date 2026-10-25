@@ -29,4 +29,5 @@ tasks.named<org.springframework.boot.gradle.tasks.run.BootRun>("bootRun") {
 tasks.test {
     // The crash fixture forks the actual app on the same test runtime classpath.
     systemProperty("telemetry.test.runtime-classpath", sourceSets.test.get().runtimeClasspath.asPath)
+    systemProperty("kafka.failover.compose", rootProject.file("load-tests/kafka-failover/compose.yaml").absolutePath)
 }
