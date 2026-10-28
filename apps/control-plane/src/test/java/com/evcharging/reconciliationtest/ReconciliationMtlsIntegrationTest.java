@@ -44,6 +44,7 @@ class ReconciliationMtlsIntegrationTest {
     private static ConfigurableApplicationContext app;
     private static int port;
     private static HttpClient allowed;
+    private static HttpClient rotated;
     private static HttpClient otherTrusted;
     private static HttpClient untrusted;
     private static HttpClient ambiguous;
@@ -55,6 +56,7 @@ class ReconciliationMtlsIntegrationTest {
         app = startApp(true, ProbeController.class);
         port = ((ServletWebServerApplicationContext) app).getWebServer().getPort();
         allowed = certificates.client(certificates.allowedStore);
+        rotated = certificates.client(certificates.rotatedStore);
         otherTrusted = certificates.client(certificates.otherStore);
         untrusted = certificates.client(certificates.untrustedStore);
         ambiguous = certificates.client(certificates.ambiguousStore);
@@ -63,7 +65,7 @@ class ReconciliationMtlsIntegrationTest {
 
     @AfterAll
     static void stop() throws Exception {
-        for (HttpClient client : new HttpClient[] {allowed, otherTrusted, untrusted, ambiguous, noCertificate}) {
+        for (HttpClient client : new HttpClient[] {allowed, rotated, otherTrusted, untrusted, ambiguous, noCertificate}) {
             if (client != null) client.close();
         }
         if (app != null) app.close();
@@ -89,6 +91,21 @@ class ReconciliationMtlsIntegrationTest {
     }
 
     @Test
+    void replacingTrustStoreAcceptsRotatedCredentialAndRejectsOldCredential() throws Exception {
+        // Both credentials are valid while the trust store contains both certificates.
+        assertThat(post(allowed, GOOD).statusCode()).isEqualTo(204);
+        assertThat(post(rotated, GOOD).statusCode()).isEqualTo(204);
+
+        // A restarted server that trusts only the replacement must not accept the old certificate.
+        try (ConfigurableApplicationContext replacement = startApp(
+                true, ProbeController.class, true, certificates.rotatedOnlyTrustStore)) {
+            int replacementPort = ((ServletWebServerApplicationContext) replacement).getWebServer().getPort();
+            assertThat(post(rotated, GOOD, replacementPort).statusCode()).isEqualTo(204);
+            assertThat(post(allowed, GOOD, replacementPort).statusCode()).isEqualTo(401);
+        }
+    }
+
+    @Test
     void disabledConfigurationDeniesTheReservedPath() {
         try (ConfigurableApplicationContext disabled = startApp(false, ControlPlaneApplication.class, false)) {
             int disabledPort = ((ServletWebServerApplicationContext) disabled).getWebServer().getPort();
@@ -110,7 +127,11 @@ class ReconciliationMtlsIntegrationTest {
     }
 
     private static HttpResponse<Void> post(HttpClient client, String body) throws Exception {
-        var request = HttpRequest.newBuilder(URI.create("https://localhost:" + port + PATH))
+        return post(client, body, port);
+    }
+
+    private static HttpResponse<Void> post(HttpClient client, String body, int targetPort) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create("https://localhost:" + targetPort + PATH))
                 .header("Content-Type", "application/json")
                 .timeout(Duration.ofSeconds(5))
                 .POST(HttpRequest.BodyPublishers.ofString(body)).build();
@@ -122,6 +143,11 @@ class ReconciliationMtlsIntegrationTest {
     }
 
     private static ConfigurableApplicationContext startApp(boolean enabled, Class<?> source, boolean tls) {
+        return startApp(enabled, source, tls, certificates.clientTrustStore);
+    }
+
+    private static ConfigurableApplicationContext startApp(boolean enabled, Class<?> source, boolean tls,
+                                                            Path clientTrustStore) {
         var application = new SpringApplication(ControlPlaneApplication.class, source);
         Map<String, Object> properties = new java.util.HashMap<>(Map.of(
                 "server.port", "0",
@@ -141,7 +167,7 @@ class ReconciliationMtlsIntegrationTest {
                     "server.ssl.key-store", certificates.serverStore.toString(),
                     "server.ssl.key-store-password", certificates.password,
                     "server.ssl.key-store-type", "PKCS12",
-                    "server.ssl.trust-store", certificates.clientTrustStore.toString(),
+                    "server.ssl.trust-store", clientTrustStore.toString(),
                     "server.ssl.trust-store-password", certificates.password,
                     "server.ssl.trust-store-type", "PKCS12"));
         }
@@ -182,21 +208,25 @@ class ReconciliationMtlsIntegrationTest {
         private final String password = UUID.randomUUID().toString();
         private final Path serverStore;
         private final Path allowedStore;
+        private final Path rotatedStore;
         private final Path otherStore;
         private final Path untrustedStore;
         private final Path ambiguousStore;
         private final Path serverTrustStore;
         private final Path clientTrustStore;
+        private final Path rotatedOnlyTrustStore;
 
         private TestCertificates() throws Exception {
             directory = Files.createTempDirectory("reconciliation-mtls-");
             serverStore = keypair("server", "CN=localhost", "SAN=dns:localhost");
             allowedStore = keypair("allowed", "CN=fixture", "SAN=uri:urn:ev-charging:reconciliation:fixture");
+            rotatedStore = keypair("rotated", "CN=fixture-rotated", "SAN=uri:urn:ev-charging:reconciliation:fixture");
             otherStore = keypair("other", "CN=other", "SAN=uri:urn:ev-charging:reconciliation:other");
             untrustedStore = keypair("untrusted", "CN=untrusted", "SAN=uri:urn:ev-charging:reconciliation:fixture");
             ambiguousStore = keypair("ambiguous", "CN=ambiguous", "SAN=uri:urn:ev-charging:reconciliation:fixture,uri:urn:ev-charging:reconciliation:other");
             serverTrustStore = trustStore("server-trust", serverStore);
-            clientTrustStore = trustStore("client-trust", allowedStore, otherStore, ambiguousStore);
+            clientTrustStore = trustStore("client-trust", allowedStore, rotatedStore, otherStore, ambiguousStore);
+            rotatedOnlyTrustStore = trustStore("rotated-only-trust", rotatedStore);
         }
 
         private Path keypair(String alias, String dname, String extension) throws Exception {
