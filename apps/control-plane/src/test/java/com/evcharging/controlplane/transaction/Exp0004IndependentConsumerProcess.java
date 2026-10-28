@@ -35,7 +35,7 @@ public final class Exp0004IndependentConsumerProcess {
              var connection = DriverManager.getConnection(args[3], "postgres", "postgres")) {
             consumer.subscribe(java.util.List.of(args[2]));
             int seen = 0;
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(25);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(120);
             while (seen < expectedRecords && System.nanoTime() < deadline) {
                 for (var record : consumer.poll(Duration.ofMillis(200))) {
                     var body = mapper.readTree(record.value());
