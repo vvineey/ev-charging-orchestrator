@@ -48,6 +48,7 @@ class ReconciliationMtlsIntegrationTest {
     private static HttpClient otherTrusted;
     private static HttpClient untrusted;
     private static HttpClient ambiguous;
+    private static HttpClient noUri;
     private static HttpClient noCertificate;
 
     @BeforeAll
@@ -60,12 +61,13 @@ class ReconciliationMtlsIntegrationTest {
         otherTrusted = certificates.client(certificates.otherStore);
         untrusted = certificates.client(certificates.untrustedStore);
         ambiguous = certificates.client(certificates.ambiguousStore);
+        noUri = certificates.client(certificates.noUriStore);
         noCertificate = certificates.client(null);
     }
 
     @AfterAll
     static void stop() throws Exception {
-        for (HttpClient client : new HttpClient[] {allowed, rotated, otherTrusted, untrusted, ambiguous, noCertificate}) {
+        for (HttpClient client : new HttpClient[] {allowed, rotated, otherTrusted, untrusted, ambiguous, noUri, noCertificate}) {
             if (client != null) client.close();
         }
         if (app != null) app.close();
@@ -88,6 +90,22 @@ class ReconciliationMtlsIntegrationTest {
         // With client-auth=want, a certificate outside the server trust store may be omitted by the client.
         // The request must still be rejected by the protected route.
         assertThat(post(untrusted, GOOD).statusCode()).isEqualTo(401);
+    }
+
+    @Test
+    void rejectsTrustedCertificateWithoutServiceUriSan() throws Exception {
+        assertThat(post(noUri, GOOD).statusCode()).isEqualTo(401);
+    }
+
+    @Test
+    void ignoresClaimedIdentityHeadersWithoutVerifiedCertificate() throws Exception {
+        var request = HttpRequest.newBuilder(URI.create("https://localhost:" + port + PATH))
+                .header("Content-Type", "application/json")
+                .header("X-Forwarded-Client-Cert", "urn:ev-charging:reconciliation:fixture")
+                .header("X-Reconciliation-Client-Uri", "urn:ev-charging:reconciliation:fixture")
+                .timeout(Duration.ofSeconds(5))
+                .POST(HttpRequest.BodyPublishers.ofString(GOOD)).build();
+        assertThat(noCertificate.send(request, HttpResponse.BodyHandlers.discarding()).statusCode()).isEqualTo(401);
     }
 
     @Test
@@ -212,6 +230,7 @@ class ReconciliationMtlsIntegrationTest {
         private final Path otherStore;
         private final Path untrustedStore;
         private final Path ambiguousStore;
+        private final Path noUriStore;
         private final Path serverTrustStore;
         private final Path clientTrustStore;
         private final Path rotatedOnlyTrustStore;
@@ -224,8 +243,9 @@ class ReconciliationMtlsIntegrationTest {
             otherStore = keypair("other", "CN=other", "SAN=uri:urn:ev-charging:reconciliation:other");
             untrustedStore = keypair("untrusted", "CN=untrusted", "SAN=uri:urn:ev-charging:reconciliation:fixture");
             ambiguousStore = keypair("ambiguous", "CN=ambiguous", "SAN=uri:urn:ev-charging:reconciliation:fixture,uri:urn:ev-charging:reconciliation:other");
+            noUriStore = keypair("no-uri", "CN=fixture", "SAN=dns:fixture.invalid");
             serverTrustStore = trustStore("server-trust", serverStore);
-            clientTrustStore = trustStore("client-trust", allowedStore, rotatedStore, otherStore, ambiguousStore);
+            clientTrustStore = trustStore("client-trust", allowedStore, rotatedStore, otherStore, ambiguousStore, noUriStore);
             rotatedOnlyTrustStore = trustStore("rotated-only-trust", rotatedStore);
         }
 
