@@ -216,15 +216,7 @@ class Exp0004CloseoutRatePilotTest {
 
                     try (var consumerDatabase = EmbeddedPostgres.builder().start()) {
                         String consumerJdbcUrl = consumerDatabase.getJdbcUrl("postgres", "postgres");
-                        try (var connection = DriverManager.getConnection(
-                                consumerJdbcUrl, "postgres", "postgres");
-                             var statement = connection.createStatement()) {
-                            statement.execute("""
-                                    CREATE TABLE exp0004_effect (
-                                        event_id UUID PRIMARY KEY,
-                                        transaction_id TEXT NOT NULL UNIQUE)
-                                    """);
-                        }
+                        Exp0004IndependentConsumerProcess.createTables(consumerJdbcUrl);
                         String groupId = "exp0004-batch-fail-effect-" + run;
                         assertThat(runConsumer("crash-after-db", outputTopic, consumerJdbcUrl,
                                 groupId, 1)).isEqualTo(137);
@@ -241,6 +233,43 @@ class Exp0004CloseoutRatePilotTest {
                 }
             } finally {
                 inbox.stop();
+            }
+        }
+    }
+
+    @Test
+    void sameCloseoutEventIdWithDifferentEnergyRecordsAConflict() throws Exception {
+        String run = UUID.randomUUID().toString();
+        String topic = "exp0004-effect-conflict-" + run;
+        String transactionId = "TX-EFFECT-CONFLICT-" + run;
+        String brokers = broker.getBrokersAsString();
+        UUID eventId = UUID.randomUUID();
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", brokers));
+             var output = producer(brokers);
+             var consumerDatabase = EmbeddedPostgres.builder().start()) {
+            admin.createTopics(List.of(new NewTopic(topic, 1, (short) 1))).all().get(10, TimeUnit.SECONDS);
+            String jdbcUrl = consumerDatabase.getJdbcUrl("postgres", "postgres");
+            Exp0004IndependentConsumerProcess.createTables(jdbcUrl);
+            for (String energyWh : List.of("2500", "2600")) {
+                String payload = Exp0004DirectPublishProcess.eventPayload(eventId, transactionId, energyWh);
+                output.send(new ProducerRecord<>(topic, "ST-TEST", payload)).get(10, TimeUnit.SECONDS);
+            }
+
+            Exp0004IndependentConsumerProcess.main(new String[]{"normal", brokers, topic, jdbcUrl, topic, "2"});
+
+            assertThat(effectCount(jdbcUrl)).isEqualTo(1);
+            try (var connection = DriverManager.getConnection(jdbcUrl, "postgres", "postgres");
+                 var statement = connection.createStatement();
+                 var result = statement.executeQuery("""
+                         SELECT e.event_id, e.transaction_id, e.energy_wh, c.received_energy_wh
+                         FROM exp0004_effect_conflict c JOIN exp0004_effect e USING (event_id)
+                         """)) {
+                assertThat(result.next()).isTrue();
+                assertThat(result.getObject("event_id", UUID.class)).isEqualTo(eventId);
+                assertThat(result.getString("transaction_id")).isEqualTo(transactionId);
+                assertThat(result.getBigDecimal("energy_wh")).isEqualByComparingTo("2500");
+                assertThat(result.getBigDecimal("received_energy_wh")).isEqualByComparingTo("2600");
+                assertThat(result.next()).isFalse();
             }
         }
     }

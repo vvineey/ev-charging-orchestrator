@@ -374,15 +374,7 @@ class OcppGatewayToInboxIntegrationTest {
                     "relay_recovered", outputTopic, transactionId, null, null);
             try (var effectDatabase = EmbeddedPostgres.builder().start()) {
                 String effectJdbcUrl = effectDatabase.getJdbcUrl("postgres", "postgres");
-                try (var connection = DriverManager.getConnection(effectJdbcUrl, "postgres", "postgres");
-                     var statement = connection.createStatement()) {
-                    statement.execute("""
-                            CREATE TABLE exp0004_effect (
-                                event_id UUID PRIMARY KEY,
-                                transaction_id TEXT NOT NULL UNIQUE
-                            )
-                            """);
-                }
+                Exp0004IndependentConsumerProcess.createTables(effectJdbcUrl);
                 String groupId = "exp0004-wss-effect-" + UUID.randomUUID();
                 assertThat(runExp0004ConsumerChild(outputTopic, effectJdbcUrl, groupId)).isZero();
                 try (var connection = DriverManager.getConnection(effectJdbcUrl, "postgres", "postgres");

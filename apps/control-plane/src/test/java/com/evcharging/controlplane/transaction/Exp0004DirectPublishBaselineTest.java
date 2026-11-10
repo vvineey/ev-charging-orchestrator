@@ -319,15 +319,7 @@ class Exp0004DirectPublishBaselineTest {
 
                 try (var consumerDatabase = EmbeddedPostgres.builder().start()) {
                     String consumerJdbcUrl = consumerDatabase.getJdbcUrl("postgres", "postgres");
-                    try (var connection = DriverManager.getConnection(consumerJdbcUrl, "postgres", "postgres");
-                         var statement = connection.createStatement()) {
-                        statement.execute("""
-                                CREATE TABLE exp0004_effect (
-                                    event_id UUID PRIMARY KEY,
-                                    transaction_id TEXT NOT NULL UNIQUE
-                                )
-                                """);
-                    }
+                    Exp0004IndependentConsumerProcess.createTables(consumerJdbcUrl);
                     String groupId = "exp0004-independent-effect-" + UUID.randomUUID();
                     assertThat(runConsumer("crash-after-db", outputTopic, consumerJdbcUrl, groupId, 1))
                             .isEqualTo(137);
