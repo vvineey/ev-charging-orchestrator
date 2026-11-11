@@ -134,6 +134,57 @@ class TransactionInboxKafkaPostgresTest {
     }
 
     @Test
+    void consumerOwnershipTransferKeepsSourceAndInvalidatesLateConflict() throws Exception {
+        String transactionId = "TX-REBALANCE-" + UUID.randomUUID();
+        String groupId = "transaction-test-" + UUID.randomUUID();
+        start(groupId, listener::consume);
+        send(transactionId, 0, "Started", 10000, true, false);
+        waitForOffset(1);
+        assertThat(eventCount(transactionId)).isEqualTo(1);
+        assertThat(state(transactionId)).isEqualTo("PENDING");
+        assertThat(sessionCount(transactionId)).isZero();
+        assertThat(conflictCount(transactionId)).isZero();
+
+        var takeover = factory.createContainer(topic);
+        takeover.getContainerProperties().setGroupId(groupId);
+        takeover.getContainerProperties().setPollTimeout(100);
+        takeover.getContainerProperties().setMessageListener((MessageListener<String, String>) listener::consume);
+        try {
+            takeover.start();
+            container.stop();
+            container = null;
+            await().atMost(Duration.ofSeconds(25)).untilAsserted(() ->
+                    assertThat(takeover.getAssignedPartitions()).contains(new TopicPartition(topic, 0)));
+
+            send(transactionId, 1, "Ended", 12500, false, false);
+            waitForOffset(2);
+            awaitState(transactionId, "PROVISIONAL");
+            assertThat(eventCount(transactionId)).isEqualTo(2);
+            assertThat(sessionCount(transactionId)).isEqualTo(1);
+            assertThat(energy(transactionId)).isEqualByComparingTo("2500");
+            assertThat(conflictCount(transactionId)).isZero();
+
+            send(transactionId, 1, "Ended", 12500, false, false);
+            waitForOffset(3);
+            assertThat(eventCount(transactionId)).isEqualTo(2);
+            assertThat(sessionCount(transactionId)).isEqualTo(1);
+            assertThat(candidateStatus(transactionId)).isEqualTo("PROVISIONAL");
+            assertThat(conflictCount(transactionId)).isZero();
+
+            send(transactionId, 1, "Ended", 12600, false, false);
+            waitForOffset(4);
+            awaitState(transactionId, "HOLD_AFTER_PROVISIONAL");
+            assertThat(reason(transactionId)).isEqualTo("SOURCE_CONFLICT");
+            assertThat(eventCount(transactionId)).isEqualTo(2);
+            assertThat(sessionCount(transactionId)).isEqualTo(1);
+            assertThat(candidateStatus(transactionId)).isEqualTo("INVALIDATED");
+            assertThat(conflictCount(transactionId)).isEqualTo(1);
+        } finally {
+            takeover.stop();
+        }
+    }
+
+    @Test
     void lateSourceConflictInvalidatesProvisionalCandidateWithoutChangingItsEvidence() throws Exception {
         String transactionId = "TX-LATE-CONFLICT";
         send(transactionId, 0, "Started", 10000, true, false);
@@ -386,6 +437,11 @@ class TransactionInboxKafkaPostgresTest {
 
     private long sessionCount(String transactionId) {
         return jdbc.sql("SELECT count(*) FROM transaction_session_candidate WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id")
+                .param("id", transactionId).query(Long.class).single();
+    }
+
+    private long conflictCount(String transactionId) {
+        return jdbc.sql("SELECT count(*) FROM transaction_inbox_conflict WHERE charging_station_id = 'CS-TEST' AND transaction_id = :id")
                 .param("id", transactionId).query(Long.class).single();
     }
 
