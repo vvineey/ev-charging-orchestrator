@@ -129,8 +129,8 @@ class JdbcTransactionInbox {
                 .param("transactionId", event.transactionId()).update();
     }
 
-    void insertCandidate(ObservedTransactionRecord event, TransactionRecoveryRules.Outcome result) {
-        jdbc.sql("""
+    boolean insertCandidate(ObservedTransactionRecord event, TransactionRecoveryRules.Outcome result) {
+        return jdbc.sql("""
                 INSERT INTO transaction_session_candidate
                   (charging_station_id, transaction_id, station_id, evse_id, started_at, ended_at, energy_wh)
                 VALUES (:chargingStationId, :transactionId, :stationId, :evseId, :startedAt, :endedAt, :energyWh)
@@ -142,11 +142,11 @@ class JdbcTransactionInbox {
                 .param("evseId", result.evseId())
                 .param("startedAt", OffsetDateTime.ofInstant(result.startedAt(), java.time.ZoneOffset.UTC))
                 .param("endedAt", OffsetDateTime.ofInstant(result.endedAt(), java.time.ZoneOffset.UTC))
-                .param("energyWh", result.energyWh()).update();
+                .param("energyWh", result.energyWh()).update() == 1;
     }
 
-    void invalidateCandidate(ObservedTransactionRecord event, String reason) {
-        jdbc.sql("""
+    boolean invalidateCandidate(ObservedTransactionRecord event, String reason) {
+        return jdbc.sql("""
                 UPDATE transaction_session_candidate
                 SET candidate_status = 'INVALIDATED', invalidated_at = clock_timestamp(),
                     invalidation_reason = :reason
@@ -155,6 +155,6 @@ class JdbcTransactionInbox {
                 """)
                 .param("reason", reason)
                 .param("chargingStationId", event.chargingStationId())
-                .param("transactionId", event.transactionId()).update();
+                .param("transactionId", event.transactionId()).update() == 1;
     }
 }

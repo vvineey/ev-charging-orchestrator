@@ -282,6 +282,8 @@ class TransactionInboxKafkaPostgresTest {
         awaitState(transactionId, "PROVISIONAL");
         assertThat(sessionCount(transactionId)).isEqualTo(1);
         assertThat(offset()).isEqualTo(1);
+        String publication = jdbc.sql("SELECT payload::text FROM transaction_usage_outbox WHERE transaction_id = :transactionId")
+                .param("transactionId", transactionId).query(String.class).single();
 
         start(groupId, listener::consume);
         waitForOffset(2);
@@ -289,6 +291,8 @@ class TransactionInboxKafkaPostgresTest {
         assertThat(sessionCount(transactionId)).isEqualTo(1);
         assertThat(energy(transactionId)).isEqualByComparingTo("2500");
         assertThat(candidateStatus(transactionId)).isEqualTo("PROVISIONAL");
+        assertThat(jdbc.sql("SELECT payload::text FROM transaction_usage_outbox WHERE transaction_id = :transactionId")
+                .param("transactionId", transactionId).query(String.class).single()).isEqualTo(publication);
     }
 
     private void start() {
