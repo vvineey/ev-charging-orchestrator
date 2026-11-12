@@ -15,6 +15,7 @@ import static org.mockito.Mockito.when;
 class StoreTransactionObservationTest {
     private final JdbcTransactionInbox inbox = mock(JdbcTransactionInbox.class);
     private final TransactionRecoveryRules rules = mock(TransactionRecoveryRules.class);
+    private final JdbcTransactionUsageOutbox outbox = mock(JdbcTransactionUsageOutbox.class);
     private final ObservedTransactionRecord event = new ObservedTransactionRecord(UUID.randomUUID(), "ST-TEST",
             "CS-TEST", "TX-TEST", 2, "Ended", Instant.parse("2026-01-01T10:20:00Z"),
             Instant.parse("2026-01-01T10:20:01Z"), "{}", null);
@@ -29,9 +30,10 @@ class StoreTransactionObservationTest {
         when(inbox.events(event)).thenReturn(List.of());
         when(rules.evaluate(List.of())).thenReturn(result);
 
-        new StoreTransactionObservation(inbox, rules, false).store(event);
+        new StoreTransactionObservation(inbox, rules, outbox, false).store(event);
         verify(inbox).updateState(event, "HOLD", "METER_POLICY_PENDING", 1);
         verify(inbox, never()).insertCandidate(event, result);
+        verify(outbox, never()).appendCandidate(event);
     }
 
     @Test
@@ -43,9 +45,11 @@ class StoreTransactionObservationTest {
         when(inbox.insertEvent(event)).thenReturn(true);
         when(inbox.events(event)).thenReturn(List.of());
         when(rules.evaluate(List.of())).thenReturn(result);
+        when(inbox.insertCandidate(event, result)).thenReturn(true);
 
-        new StoreTransactionObservation(inbox, rules, true).store(event);
+        new StoreTransactionObservation(inbox, rules, outbox, true).store(event);
         verify(inbox).insertCandidate(event, result);
+        verify(outbox).appendCandidate(event);
         verify(inbox).updateState(event, "PROVISIONAL", null, 1);
     }
 
@@ -54,10 +58,12 @@ class StoreTransactionObservationTest {
         when(inbox.ensureAndLock(event)).thenReturn(new JdbcTransactionInbox.State("ST-TEST", "PROVISIONAL"));
         when(inbox.insertEvent(event)).thenReturn(false);
         when(inbox.sameSource(event)).thenReturn(false);
+        when(inbox.invalidateCandidate(event, "SOURCE_CONFLICT")).thenReturn(true);
 
-        new StoreTransactionObservation(inbox, rules, true).store(event);
+        new StoreTransactionObservation(inbox, rules, outbox, true).store(event);
         verify(inbox).preserveConflict(event);
         verify(inbox).invalidateCandidate(event, "SOURCE_CONFLICT");
+        verify(outbox).appendCandidate(event);
         verify(inbox).updateState(event, "HOLD_AFTER_PROVISIONAL", "SOURCE_CONFLICT", null);
         verify(inbox, never()).insertCandidate(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
     }
@@ -68,9 +74,11 @@ class StoreTransactionObservationTest {
         when(inbox.insertEvent(event)).thenReturn(true);
         when(inbox.events(event)).thenReturn(List.of());
         when(rules.evaluate(List.of())).thenReturn(TransactionRecoveryRules.Outcome.hold("INVALID_SEQUENCE"));
+        when(inbox.invalidateCandidate(event, "LATE_INVALID_EVENT")).thenReturn(true);
 
-        new StoreTransactionObservation(inbox, rules, true).store(event);
+        new StoreTransactionObservation(inbox, rules, outbox, true).store(event);
         verify(inbox).invalidateCandidate(event, "LATE_INVALID_EVENT");
+        verify(outbox).appendCandidate(event);
         verify(inbox).updateState(event, "HOLD_AFTER_PROVISIONAL", "LATE_INVALID_EVENT", null);
     }
 
@@ -84,8 +92,25 @@ class StoreTransactionObservationTest {
         when(inbox.sameSource(event)).thenReturn(true);
         when(inbox.events(event)).thenReturn(List.of());
         when(rules.evaluate(List.of())).thenReturn(result);
+        when(inbox.insertCandidate(event, result)).thenReturn(true);
 
-        new StoreTransactionObservation(inbox, rules, true).store(event);
+        new StoreTransactionObservation(inbox, rules, outbox, true).store(event);
         verify(inbox).insertCandidate(event, result);
+        verify(outbox).appendCandidate(event);
+    }
+
+    @Test
+    void unchangedCandidateDoesNotCreateAnotherPublicationIntent() {
+        var result = new TransactionRecoveryRules.Outcome("CALCULATED", null, 1,
+                Instant.parse("2026-01-01T10:00:00Z"), Instant.parse("2026-01-01T10:20:00Z"), new BigDecimal("2500"));
+        when(inbox.ensureAndLock(event)).thenReturn(new JdbcTransactionInbox.State("ST-TEST", "HOLD"));
+        when(inbox.insertEvent(event)).thenReturn(false);
+        when(inbox.sameSource(event)).thenReturn(true);
+        when(inbox.events(event)).thenReturn(List.of());
+        when(rules.evaluate(List.of())).thenReturn(result);
+        when(inbox.insertCandidate(event, result)).thenReturn(false);
+
+        new StoreTransactionObservation(inbox, rules, outbox, true).store(event);
+        verify(outbox, never()).appendCandidate(event);
     }
 }

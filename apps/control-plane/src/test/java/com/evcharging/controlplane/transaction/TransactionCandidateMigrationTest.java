@@ -56,6 +56,9 @@ class TransactionCandidateMigrationTest {
                     SELECT count(*) FROM transaction_session_candidate
                     WHERE calculated_at IS NOT NULL AND energy_wh = 2500
                     """, Long.class)).isEqualTo(2L);
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM transaction_session_candidate WHERE aggregate_version = 0",
+                    Long.class)).isEqualTo(2L);
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM transaction_usage_outbox", Long.class)).isZero();
         }
     }
 }

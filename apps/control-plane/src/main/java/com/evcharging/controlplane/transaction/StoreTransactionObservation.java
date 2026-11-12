@@ -8,13 +8,15 @@ import org.springframework.transaction.annotation.Transactional;
 class StoreTransactionObservation {
     private final JdbcTransactionInbox inbox;
     private final TransactionRecoveryRules rules;
+    private final JdbcTransactionUsageOutbox outbox;
     private final boolean experimentalCandidateCalculation;
 
-    StoreTransactionObservation(JdbcTransactionInbox inbox, TransactionRecoveryRules rules,
+    StoreTransactionObservation(JdbcTransactionInbox inbox, TransactionRecoveryRules rules, JdbcTransactionUsageOutbox outbox,
             @Value("${transaction.recovery.experimental-candidate-calculation-enabled:false}")
             boolean experimentalCandidateCalculation) {
         this.inbox = inbox;
         this.rules = rules;
+        this.outbox = outbox;
         this.experimentalCandidateCalculation = experimentalCandidateCalculation;
     }
 
@@ -40,7 +42,7 @@ class StoreTransactionObservation {
         }
         TransactionRecoveryRules.Outcome outcome = rules.evaluate(inbox.events(event));
         if ("PROVISIONAL".equals(state.status()) && !"CALCULATED".equals(outcome.status())) {
-            inbox.invalidateCandidate(event, "LATE_INVALID_EVENT");
+            if (inbox.invalidateCandidate(event, "LATE_INVALID_EVENT")) outbox.appendCandidate(event);
             inbox.updateState(event, "HOLD_AFTER_PROVISIONAL", "LATE_INVALID_EVENT", null);
             return;
         }
@@ -49,7 +51,7 @@ class StoreTransactionObservation {
                 inbox.updateState(event, "HOLD", "METER_POLICY_PENDING", outcome.evseId());
                 return;
             }
-            inbox.insertCandidate(event, outcome);
+            if (inbox.insertCandidate(event, outcome)) outbox.appendCandidate(event);
             inbox.updateState(event, "PROVISIONAL", null, outcome.evseId());
             return;
         }
@@ -59,7 +61,7 @@ class StoreTransactionObservation {
     private void holdConflict(ObservedTransactionRecord event, JdbcTransactionInbox.State previous) {
         if ("HOLD_AFTER_PROVISIONAL".equals(previous.status())) return;
         boolean provisional = "PROVISIONAL".equals(previous.status());
-        if (provisional) inbox.invalidateCandidate(event, "SOURCE_CONFLICT");
+        if (provisional && inbox.invalidateCandidate(event, "SOURCE_CONFLICT")) outbox.appendCandidate(event);
         String status = provisional ? "HOLD_AFTER_PROVISIONAL" : "HOLD_CONFLICT";
         inbox.updateState(event, status, "SOURCE_CONFLICT", null);
     }
