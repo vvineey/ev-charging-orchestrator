@@ -52,4 +52,13 @@ tasks.test {
     systemProperty("exp0003.steady.cdc-poll-ms", project.findProperty("exp0003SteadyCdcPollMs")?.toString() ?: "default")
     systemProperty("exp0003.steady.output", project.findProperty("exp0003SteadyOutput")?.toString()
             ?: layout.buildDirectory.file("experiment-results/exp0003-steady-result.json").get().asFile.absolutePath)
+    systemProperty("exp0003.soak.enabled", project.findProperty("exp0003Soak")?.toString() ?: "false")
+    systemProperty("exp0003.soak.rate", project.findProperty("exp0003SoakRate")?.toString() ?: "200")
+    systemProperty("exp0003.soak.seconds", project.findProperty("exp0003SoakSeconds")?.toString() ?: "300")
+    systemProperty("exp0003.soak.cdc-poll-ms", project.findProperty("exp0003SoakCdcPollMs")?.toString() ?: "50")
+    systemProperty("exp0003.soak.code-commit", project.findProperty("exp0003SoakCodeCommit")?.toString() ?: "unknown")
+    systemProperty("exp0003.soak.output", project.findProperty("exp0003SoakOutput")?.toString()
+            ?: layout.buildDirectory.file("experiment-results/exp0003-soak-result.json").get().asFile.absolutePath)
+    systemProperty("exp0003.soak.checkpoints", project.findProperty("exp0003SoakCheckpoints")?.toString()
+            ?: layout.buildDirectory.file("experiment-results/exp0003-soak-checkpoints.jsonl").get().asFile.absolutePath)
 }
